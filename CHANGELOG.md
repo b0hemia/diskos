@@ -34,7 +34,9 @@ diskOS remains beta software; version numbers do not imply broad hardware or fea
 - V2.40 firmware support, flash-tested alongside V2.09 and V2.28 on Linux x86-64.
 - Album cover flow with horizontal swipe navigation, pre-baked cover sprites, and reflections.
   Dynamic album lists and a bounded sprite cache accommodate libraries with thousands of albums.
-- Dedicated Books view for single-file `.m4b` audiobooks with saved listening positions.
+- Dedicated Books view for single-file `.m4b` audiobooks with saved listening positions, plus
+  chapter navigation from Now Playing (jump to a chapter, current chapter highlighted, with titles
+  and durations).
 - File/folder browsing on the microSD card, with playback of selected library tracks.
   Playback uses the all-songs queue, not a folder-only queue.
 - Bundled Noto Sans glyphs for Latin-extended, Greek, and Cyrillic library text.

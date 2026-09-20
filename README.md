@@ -85,10 +85,6 @@ Not affiliated with or endorsed by FiiO, Snowsky, or Ingenic. No warranty or sup
   </tr>
 </table>
 
-<p align="center">
-  <img src="docs/assets/boot-animation.gif" alt="diskOS boot animation concept" width="320">
-  <br><sub>Boot animation concept: clockwise from the lower-left, matching the real seek-ring geometry.</sub>
-</p>
 
 ### Built around the Disc
 
@@ -114,8 +110,9 @@ thousands of albums without keeping every cover in memory. Albums without cached
 placeholder.
 
 **Books** gives single-file `.m4b` audiobooks a dedicated view with saved listening positions.
-They are separated from the music library and music queues, including existing library entries
-migrated during an upgrade. Open a book to continue listening from its saved progress.
+They stay out of the music library and queues (existing library entries migrate on upgrade). Open a
+book to resume where you left off. From Now Playing, a **chapter list** lets you jump between
+chapters: it opens centred on the current chapter and shows each chapter's title and duration.
 
 **Files** provides the familiar stock-style route through the microSD card's folder tree.
 Browse folders and tap an indexed music file to play it. Playback uses the all-songs queue;
