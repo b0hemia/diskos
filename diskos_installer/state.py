@@ -254,5 +254,25 @@ def wipe_all():
             return d, [(d, "state dir is not owned by you - refusing to delete")]
     except OSError as e:
         return d, [(d, str(e))]
+    # A leftover case-sensitive scratch mount from a macOS build must be detached BEFORE we
+    # recurse: rmtree traversing a live mount could delete the mounted contents or the backing
+    # image. Detach a stale one (bounded retries), and refuse to delete while it is still mounted.
+    scratch = os.path.join(d, "build", ".cs-scratch")
+    if os.path.ismount(scratch):
+        import subprocess, time
+        for i in range(6):
+            if not os.path.ismount(scratch):
+                break
+            try:
+                subprocess.run(["hdiutil", "detach", scratch] + (["-force"] if i >= 3 else []),
+                               capture_output=True, text=True, timeout=60)
+            except FileNotFoundError:
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            time.sleep(0.4 * (i + 1))
+        if os.path.ismount(scratch):
+            return d, [(scratch, "a case-sensitive scratch volume is still mounted here; detach "
+                        "it (hdiutil detach) and retry")]
     shutil.rmtree(d, onerror=lambda fn, path, exc: errs.append((path, str(exc[1]))))
     return d, errs

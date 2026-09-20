@@ -26,7 +26,7 @@ Handler-level RE of both binaries; corrections spot-checked against the binary a
 - **`0201`** = generic transport toggle (not Roon-specific). **`0657`/`0666`/`06b3` "close_player" = false positive** (shared teardown preamble). `0666`=route (2=BTSRC 4=SPDIF 6=DAC).
 - **out_dev** enum has no BTSINK (that's an input/work-mode). 48k→44.1k resample is `libfiio_decoder` over FFmpeg `libswresample` - a stock path, so codec-feasible (CPU headroom still needs an on-device xrun benchmark).
 - **IPC-hardening RISK:** stock parser trusts declared LEN and uses `strlen` over the real `mq_receive` byte count → diskOS must emit strictly-correct total lengths and never forward untrusted frames.
-- Still UNVERIFIED / deep-RE TODO: exact `0642` receiver-mode values + AirPlay/DLNA/Roon/QPlay trigger sequences; `0715` runtime volume callback @0x822b14; full `SET_USB_MODE` wire encoding; `0722` OTA worker chain; CS43131 ioctl ABI; the remaining ~190 family-inferred tag meanings.
+- Still UNVERIFIED / deep-RE TODO (AirPlay/DLNA/Roon triggers now RESOLVED for V2.40 - the `0657` mode table, see COMMAND_MAP.md): `0715` runtime volume callback @0x822b14; full `SET_USB_MODE` wire encoding; `0722` OTA worker chain; CS43131 ioctl ABI; the remaining ~190 family-inferred tag meanings.
 
 ---
 
@@ -306,7 +306,7 @@ mq_player has ONE work-mode enum (pointer-array @ ~0x7bb0a0 data; names in `.str
 `0 NO_DEFINED · 1 I2S3_OUT · 2 USB_HOST_NULL · 3 NO_WORK_MODE · 4 LOCALPLAYER · 5 BTSINK · 6 ANALOG · 7 UAC(USB-DAC) · 8 DLNA · 9 AIRPLAY · 10 ROON · 11 SPDIF_OPT · 12 SPDIF_RX · 13 DMR · 14 DMC · 15 DMS · 16 MIX · 17 I2S_IN · 18 STREAM_AUDIO` (+ QPLAY). sysconfig keys NETWORK_MODE (cfg+0x5c) and OUT_DEV both feed this.
 
 ### AirPlay receiver - BUILT IN (was completely missed)
-mq_player embeds a **full shairport-sync fork**: `fiio_airplay.c` + `src/shairport.c, rtsp.c, rtp.c, dacp.c, metadata.c, mdns_avahi.c, player.c` + `libshairplay.so`. Advertises **`_raop._tcp`/`_airplay._tcp`** as **"SNOWSKY DISC"**. Config: `/usr/project/config/airplay2/x2000_airplay2.conf` (Shairport-Sync style, AirPlay 2). Flow: supervisor sees mode "AIRPLAY" → sets `airplay_play=1` (@0x7efbe4) → `start_airplay@0x436008` → pthread `airplay_func@0x435fc0` → shairport loop. Needs **wlan0 up** (`start_switch_network_mode_thread@0x46e634` monitors `/sys/class/net/wlan0/operstate`=="up", then emits `/ui` tag **a706** = GET_NET_STATUS_REPLY - a706 is STATUS, NOT the trigger). Has `airplay_artwork_thread`, DACP remote. Audio → ALSA `snd_pcm_writei` to the DAC after out_dev switch. **TRIGGER COMMAND TAG: NOT yet pinned** (a `06xx` work-mode-switch carrying AIRPLAY=9, sent via `ui_send_cmd@0x43f82c` → mqueue `/player` idx 3, frame `TAG(4)+ext1(4hex)+len(4hex)+data`). Player also has a name-string command dispatch @0x482328 (e.g. `SET_USB_MODE`). **Next step to enable AirPlay from diskOS = read the mq_ui output/work-mode menu handler (callers of 0x43f82c) to capture the literal tag+payload for AIRPLAY/UAC/DLNA/ROON.**
+mq_player embeds a **full shairport-sync fork**: `fiio_airplay.c` + `src/shairport.c, rtsp.c, rtp.c, dacp.c, metadata.c, mdns_avahi.c, player.c` + `libshairplay.so`. Advertises **`_raop._tcp`/`_airplay._tcp`** as **"SNOWSKY DISC"**. Config: `/usr/project/config/airplay2/x2000_airplay2.conf` (Shairport-Sync style, AirPlay 2). Flow: supervisor sees mode "AIRPLAY" → sets `airplay_play=1` (@0x7efbe4) → `start_airplay@0x436008` → pthread `airplay_func@0x435fc0` → shairport loop. Needs **wlan0 up** (`start_switch_network_mode_thread@0x46e634` monitors `/sys/class/net/wlan0/operstate`=="up", then emits `/ui` tag **a706** = GET_NET_STATUS_REPLY - a706 is STATUS, NOT the trigger). Has `airplay_artwork_thread`, DACP remote. Audio → ALSA `snd_pcm_writei` to the DAC after out_dev switch. **TRIGGER COMMAND TAG (SUPERSEDED for V2.40: it is `0657000C000A`, mode 0A = AirPlay, hardware-confirmed - see COMMAND_MAP.md; the AIRPLAY=9 guess below is wrong):** (a `06xx` work-mode-switch carrying AIRPLAY=9, sent via `ui_send_cmd@0x43f82c` → mqueue `/player` idx 3, frame `TAG(4)+ext1(4hex)+len(4hex)+data`). Player also has a name-string command dispatch @0x482328 (e.g. `SET_USB_MODE`). **(SUPERSEDED: the literal tags are now known - AirPlay=`0657000C000A` and the rest of the 0657 mode table, hardware-confirmed on V2.40; see COMMAND_MAP.md.)**
 
 ### Also built-in network receivers (missed): 
 - **DLNA/UPnP renderer** - `dlna_player.c`, UPnP RenderingControl/AVTransport SCPD. (mode DLNA=8)
@@ -411,7 +411,7 @@ Background-noise tags to ignore: 0807 (recurring 0/1 status), 0704 (wifi scan).
   **But the ROUTE-to-speaker frame (live-captured 2026-08-03) is `06b3<len>000X<MAC>`** (X=codec, MAC payload
   kept for stock frame-shape; worker ignores it). diskOS route uses `06b3001D0000<MAC>` (SBC). `06b4` is
   LDAC-quality only. **Full working BT-transmit sequence → COMMAND_MAP.md "BT AUDIO OUTPUT" section.**
-- Also re-confirmed: `0666`=output route, `0642`=network mode (from startup sync).
+- Also re-confirmed: `0666`=output route, `0642`=USB gadget selector (from startup sync).
 
 ## 5d. More settings - DECODED LIVE 2026-06-30 (strace stock mq_ui, clean batch)
 - **Channel balance** = `0713` - `0713000C<HHLL>`: center=`0000`; one side `00NN` (NN=step), other side `01NN`. (Same tag the audio-cluster capture saw.) Mixer-style, likely safe.

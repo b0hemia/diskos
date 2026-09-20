@@ -9,9 +9,11 @@ build locally. squashfs pack/unpack delegates to the bundled mksquashfs/unsquash
 (reference tools) - we do not reimplement squashfs.
 """
 
+import contextlib
 import os
 import re
 import subprocess
+import sys
 import zipfile
 
 from . import bundle
@@ -335,7 +337,152 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, env=bundle.native_env(), **kw)
 
 
-def _validate_squashfs_output(sq_path, unsq, expect_ui_sha, expect_ui_sz, rep=None):
+# --- case-sensitive scratch space (macOS) ------------------------------------
+# The stock Snowsky Disc rootfs is built on Linux and contains filenames that differ
+# ONLY by case in the same directory (e.g. main_1/back_home.png and main_1/BACK_HOME.png) -
+# fine on a case-sensitive filesystem, but macOS's default APFS volume is case-INsensitive
+# (case-preserving), so the second unsquashfs write collides with the first ("already
+# exists") and the extraction fails deterministically, every time, on stock Mac setups.
+def _is_case_sensitive(dir_path):
+    """Probe whether dir_path's filesystem folds case. Uses a PRIVATE, exclusively-created
+    temp subdirectory so it can never clobber a real file, be fooled by an unrelated
+    differently-cased file, or race a concurrent probe. Raises OSError on I/O or permission
+    failure - callers must NOT treat that as 'case-sensitive'."""
+    import tempfile, shutil
+    os.makedirs(dir_path, exist_ok=True)
+    probe = tempfile.mkdtemp(prefix=".diskos-cs-", dir=dir_path)
+    try:
+        with open(os.path.join(probe, "csprobe"), "w") as f:
+            f.write("x")
+        # case-insensitive fs: the uppercase alias resolves back to the file we just wrote.
+        # Use os.stat (not os.path.exists, which swallows EIO etc. and would misreport a failing
+        # filesystem as case-sensitive): only a real absence -> case-sensitive; any other error
+        # propagates so the caller can fail closed (E234).
+        try:
+            os.stat(os.path.join(probe, "CSPROBE"))
+            return False
+        except FileNotFoundError:
+            return True
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
+
+
+def _hdiutil(args, what, timeout=180):
+    """Run one hdiutil subcommand, mapping a missing tool, a timeout, or a nonzero exit to E234."""
+    try:
+        r = subprocess.run(["hdiutil", *args], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise BuildError("hdiutil not found - a case-sensitive scratch volume is required to "
+                         "build on a case-insensitive macOS filesystem.", code="E234")
+    except subprocess.TimeoutExpired:
+        raise BuildError(f"failed to {what}: hdiutil timed out after {timeout}s", code="E234")
+    if r.returncode != 0:
+        raise BuildError(f"failed to {what}: {(r.stderr or r.stdout).strip()[:400]}", code="E234")
+    return r
+
+
+def _scratch_detach(mnt, rep):
+    """Detach the scratch volume at mnt and CONFIRM it is gone. Bounded retries, escalating to
+    -force, so a transiently-busy volume never leaves a live mount the caller then 'succeeds'
+    over. Warns (never silently accepts) if it truly cannot be detached. Returns True if unmounted."""
+    import time
+    for i in range(6):
+        if not os.path.ismount(mnt):
+            return True
+        try:
+            subprocess.run(["hdiutil", "detach", mnt] + (["-force"] if i >= 3 else []),
+                           capture_output=True, text=True, timeout=60)
+        except FileNotFoundError:
+            break
+        except subprocess.TimeoutExpired:
+            pass   # count this as a failed attempt; the loop retries and then escalates to -force
+        if not os.path.ismount(mnt):
+            return True
+        time.sleep(0.4 * (i + 1))
+    if os.path.ismount(mnt):
+        rep.warning(f"the case-sensitive scratch volume at {mnt} could not be detached; run "
+                    "'hdiutil detach' on it before deleting the build directory.")
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def _case_sensitive_extract_root(workdir, rep):
+    """Yield a directory the case-colliding stock rootfs can be unsquashfs'd into safely.
+
+    If workdir is already on a case-sensitive filesystem (Linux, or a case-sensitive macOS
+    volume) yield it unchanged - a true no-op. Otherwise, on macOS only, create a FRESH
+    case-sensitive APFS sparse image, mount it under workdir, VERIFY it, yield the mountpoint,
+    and ALWAYS detach + delete it afterwards. Fails closed (E234) on any hdiutil error, a
+    case-insensitive non-macOS host, or a scratch volume that does not verify - never an unsafe
+    fallback extraction."""
+    try:
+        cs = _is_case_sensitive(workdir)
+    except OSError as e:
+        raise BuildError(f"could not probe the build filesystem at '{workdir}': {e}", code="E234")
+    if cs:
+        yield workdir
+        return
+    if sys.platform != "darwin":
+        raise BuildError(
+            f"'{workdir}' is on a case-insensitive filesystem, which cannot hold this rootfs "
+            "(it has files that differ only by case). Rebuild on a case-sensitive filesystem.",
+            code="E234")
+
+    base = os.path.join(workdir, ".cs-scratch")
+    img = base + ".sparseimage"
+    mnt = base
+    # Never let a planted symlink redirect create / attach / delete.
+    for p in (img, mnt):
+        if os.path.islink(p):
+            raise BuildError(f"refusing a symlinked scratch path: {p}", code="E234")
+    # A prior interrupted build can leave a stale mount/image. Detach a stale mount (verified) and
+    # drop a stale image so we always build on a FRESH, verified volume. Fail closed if a stale
+    # mount will not detach - do NOT reuse it or delete anything under it.
+    if os.path.ismount(mnt) and not _scratch_detach(mnt, rep):
+        raise BuildError(f"a previous scratch volume at {mnt} is still mounted; unmount it and retry.",
+                         code="E234")
+    if os.path.exists(img):
+        try:
+            os.remove(img)
+        except OSError as e:
+            raise BuildError(f"could not remove a stale scratch image {img}: {e}", code="E234")
+
+    rep.log("build directory is on a case-insensitive filesystem - creating a case-sensitive "
+            "APFS scratch volume for extraction")
+    try:
+        # create is INSIDE the cleanup scope, so a partial image from a failed/interrupted
+        # create is removed by the finally below.
+        _hdiutil(["create", "-size", "2g", "-type", "SPARSE", "-fs", "Case-sensitive APFS",
+                  "-volname", "diskOS-build", base], "create the case-sensitive scratch volume")
+        os.makedirs(mnt, exist_ok=True)
+        _hdiutil(["attach", img, "-mountpoint", mnt, "-nobrowse", "-owners", "on"],
+                 "mount the case-sensitive scratch volume")
+        if not os.path.ismount(mnt):
+            raise BuildError("the case-sensitive scratch volume did not mount as expected", code="E234")
+        try:
+            if not _is_case_sensitive(mnt):
+                raise BuildError("the scratch volume is not case-sensitive as requested", code="E234")
+        except OSError as e:
+            raise BuildError(f"the scratch volume is not usable: {e}", code="E234")
+        yield mnt
+    finally:
+        _scratch_detach(mnt, rep)
+        # Remove the backing image only once the volume is actually detached.
+        if not os.path.ismount(mnt):
+            try:
+                if os.path.exists(img):
+                    os.remove(img)
+            except OSError as e:
+                rep.warning(f"could not remove scratch image {img}: {e}")
+            try:
+                if os.path.isdir(mnt):
+                    os.rmdir(mnt)
+            except OSError:
+                pass
+
+
+def _validate_squashfs_output(sq_path, unsq, expect_ui_sha, expect_ui_sz, extract_root, rep=None):
     """Validate a freshly-repacked squashfs by its CONTENT, not the repacker's exit status. Does a
     COMPLETE independent extraction (so silent corruption ANYWHERE fails, not just in two files),
     then verifies every boot-critical artefact: the boot-hook patch in fiio_init.sh, the executable
@@ -346,7 +493,10 @@ def _validate_squashfs_output(sq_path, unsq, expect_ui_sha, expect_ui_sz, rep=No
         if f.read(4) != b"hsqs":
             raise BuildError("repacked image is not a valid squashfs (bad superblock magic) - "
                              "the repacker produced a corrupt file", code="E232")
-    tmp = tempfile.mkdtemp(prefix="diskos-sqcheck-")
+    # This is a FULL re-extraction of the same rootfs (same case-colliding filenames as the
+    # original unpack), so it needs the same case-sensitive destination - never the system tmp
+    # dir, which on macOS lives on the same case-insensitive volume as everything else.
+    tmp = tempfile.mkdtemp(prefix="diskos-sqcheck-", dir=extract_root)
     try:
         dst = os.path.join(tmp, "x")
         # FULL extraction (no file subset): a corrupt inode / metadata block / file anywhere in the
@@ -358,6 +508,7 @@ def _validate_squashfs_output(sq_path, unsq, expect_ui_sha, expect_ui_sz, rep=No
 
         def _need(rel, what):
             p = os.path.join(dst, rel)
+            _assert_within_rf(dst, p, code="E232")   # a crafted rootfs must not escape via a symlink
             if not os.path.exists(p):
                 raise BuildError(f"repacked image is missing {what} ({rel}) - do NOT flash", code="E232")
             return p
@@ -398,86 +549,87 @@ def build_image(stock_squashfs, ui_binary, variant, out_bin, workdir, rep=None):
 
     unsq = bundle.native("unsquashfs")
     mksq = bundle.native("mksquashfs")
-    rf = os.path.join(workdir, "rf")
-    if os.path.isdir(rf):
-        import shutil
-        shutil.rmtree(rf)
+    with _case_sensitive_extract_root(workdir, rep) as extract_root:
+        rf = os.path.join(extract_root, "rf")
+        if os.path.isdir(rf):
+            import shutil
+            shutil.rmtree(rf)
 
-    rep.status("[1/6] unpacking stock rootfs")
-    r = _run([unsq, "-d", rf, stock_squashfs], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise BuildError(f"unsquashfs failed: {r.stderr.strip()[:400]}", code="E230")
+        rep.status("[1/6] unpacking stock rootfs")
+        r = _run([unsq, "-d", rf, stock_squashfs], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise BuildError(f"unsquashfs failed: {r.stderr.strip()[:400]}", code="E230")
 
-    rep.status("[2/6] validating base is a Snowsky Disc rootfs")
-    validate_stock_rootfs(stock_squashfs, rep)   # product / tested-version / known-good-hash gate
+        rep.status("[2/6] validating base is a Snowsky Disc rootfs")
+        validate_stock_rootfs(stock_squashfs, rep)   # product / tested-version / known-good-hash gate
 
-    rep.status("[3/6] validating the diskOS UI binary")
-    _validate_ui_elf(ui_binary)
+        rep.status("[3/6] validating the diskOS UI binary")
+        _validate_ui_elf(ui_binary)
 
-    rep.status("[4/6] patching fiio_init.sh + installing first-boot hook")
-    fiio_path = os.path.join(rf, "usr/project/fiio_init.sh")
-    _assert_within_rf(rf, fiio_path)          # a crafted rootfs must not redirect the in-place patch
-    _patch_fiio_init(fiio_path, rep)
-    _install(bundle.data("S97diskos_install"), os.path.join(rf, "etc/init.d/S97diskos_install"), 0o755, rf)
+        rep.status("[4/6] patching fiio_init.sh + installing first-boot hook")
+        fiio_path = os.path.join(rf, "usr/project/fiio_init.sh")
+        _assert_within_rf(rf, fiio_path)          # a crafted rootfs must not redirect the in-place patch
+        _patch_fiio_init(fiio_path, rep)
+        _install(bundle.data("S97diskos_install"), os.path.join(rf, "etc/init.d/S97diskos_install"), 0o755, rf)
 
-    import hashlib
-    ui_sha = hashlib.sha256(open(ui_binary, "rb").read()).hexdigest()
-    ui_sz = os.path.getsize(ui_binary)
-    import time
-    manifest_path = os.path.join(rf, "etc/diskos_manifest")
-    _assert_within_rf(rf, manifest_path)
-    if os.path.islink(manifest_path):
-        os.unlink(manifest_path)              # never follow a planted symlink at the manifest path
-    with open(manifest_path, "w") as f:
-        f.write(f"SHA256={ui_sha}\nSIZE={ui_sz}\nARCH=mips-le\nVARIANT={variant}\n"
-                f"BUILT={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+        import hashlib
+        ui_sha = hashlib.sha256(open(ui_binary, "rb").read()).hexdigest()
+        ui_sz = os.path.getsize(ui_binary)
+        import time
+        manifest_path = os.path.join(rf, "etc/diskos_manifest")
+        _assert_within_rf(rf, manifest_path)
+        if os.path.islink(manifest_path):
+            os.unlink(manifest_path)              # never follow a planted symlink at the manifest path
+        with open(manifest_path, "w") as f:
+            f.write(f"SHA256={ui_sha}\nSIZE={ui_sz}\nARCH=mips-le\nVARIANT={variant}\n"
+                    f"BUILT={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
 
-    # Embed the UI INSIDE the rootfs at a fixed path the S97 hook installs from FIRST (SD is only a
-    # fallback source). This makes first boot need no SD card: flash -> reboot -> diskOS. The hook
-    # still verify_ui's this copy against the manifest above, so a corrupt flash can't run it.
-    _install(ui_binary, os.path.join(rf, "opt/diskos/mq_ui"), 0o755, rf)
+        # Embed the UI INSIDE the rootfs at a fixed path the S97 hook installs from FIRST (SD is only a
+        # fallback source). This makes first boot need no SD card: flash -> reboot -> diskOS. The hook
+        # still verify_ui's this copy against the manifest above, so a corrupt flash can't run it.
+        _install(ui_binary, os.path.join(rf, "opt/diskos/mq_ui"), 0o755, rf)
 
-    # Debug-access tooling (BOTH variants): the diskos-debug helper + a static dropbear. mq_ui's
-    # "Debug Mode" toggle drives these to start SSH (random per-enable password) and/or the USB
-    # serial shell on demand. Shipping them in the public image too means a normal user can enable
-    # debug access from the UI without needing the dev build.
-    _install(bundle.data("dropbearmulti"), os.path.join(rf, "usr/project/dropbearmulti"), 0o755, rf)
-    _install(bundle.data("diskos-debug.sh"), os.path.join(rf, "usr/project/diskos-debug.sh"), 0o755, rf)
+        # Debug-access tooling (BOTH variants): the diskos-debug helper + a static dropbear. mq_ui's
+        # "Debug Mode" toggle drives these to start SSH (random per-enable password) and/or the USB
+        # serial shell on demand. Shipping them in the public image too means a normal user can enable
+        # debug access from the UI without needing the dev build.
+        _install(bundle.data("dropbearmulti"), os.path.join(rf, "usr/project/dropbearmulti"), 0o755, rf)
+        _install(bundle.data("diskos-debug.sh"), os.path.join(rf, "usr/project/diskos-debug.sh"), 0o755, rf)
 
-    if variant == "dev":
-        # Dev only: an ALWAYS-ON USB serial recovery shell (builds the gadget + attaches the one
-        # diskos-debug shell at boot), so a dev build is reachable over USB even before the UI runs.
-        _install(bundle.data("S99usbserial"), os.path.join(rf, "etc/init.d/S99usbserial"), 0o755, rf)
+        if variant == "dev":
+            # Dev only: an ALWAYS-ON USB serial recovery shell (builds the gadget + attaches the one
+            # diskos-debug shell at boot), so a dev build is reachable over USB even before the UI runs.
+            _install(bundle.data("S99usbserial"), os.path.join(rf, "etc/init.d/S99usbserial"), 0o755, rf)
 
-    rep.status("[5/6] repacking squashfs (stock params: lzo, -b 131072)")
-    out_sq = os.path.join(workdir, "out.squashfs")
-    if os.path.exists(out_sq):
-        os.remove(out_sq)
-    r = _run([mksq, rf, out_sq, "-comp", "lzo", "-b", "131072",
-              "-no-xattrs", "-all-root", "-noappend"], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise BuildError(f"mksquashfs failed: {r.stderr.strip()[:400]}", code="E230")
-    sqsz = os.path.getsize(out_sq)
-    if sqsz > IMG_SIZE:
-        raise BuildError(
-            f"squashfs is {sqsz} > {IMG_SIZE} partition - refusing (truncating would "
-            "make it unbootable). Trim content or use a smaller UI.", code="E231")
+        rep.status("[5/6] repacking squashfs (stock params: lzo, -b 131072)")
+        out_sq = os.path.join(workdir, "out.squashfs")
+        if os.path.exists(out_sq):
+            os.remove(out_sq)
+        r = _run([mksq, rf, out_sq, "-comp", "lzo", "-b", "131072",
+                  "-no-xattrs", "-all-root", "-noappend"], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise BuildError(f"mksquashfs failed: {r.stderr.strip()[:400]}", code="E230")
+        sqsz = os.path.getsize(out_sq)
+        if sqsz > IMG_SIZE:
+            raise BuildError(
+                f"squashfs is {sqsz} > {IMG_SIZE} partition - refusing (truncating would "
+                "make it unbootable). Trim content or use a smaller UI.", code="E231")
 
-    # Trust the OUTPUT, not the repacker's exit code: confirm the superblock magic AND that the
-    # embedded UI extracts byte-identical (an independent unsquashfs round-trip). Catches a
-    # silently-corrupt/truncated repack - the exact failure mode a nonzero-exit-but-valid (or, worse,
-    # zero-exit-but-corrupt) mksquashfs could hide - before it ever reaches the device.
-    _validate_squashfs_output(out_sq, unsq, ui_sha, ui_sz, rep)
+        # Trust the OUTPUT, not the repacker's exit code: confirm the superblock magic AND that the
+        # embedded UI extracts byte-identical (an independent unsquashfs round-trip). Catches a
+        # silently-corrupt/truncated repack - the exact failure mode a nonzero-exit-but-valid (or, worse,
+        # zero-exit-but-corrupt) mksquashfs could hide - before it ever reaches the device.
+        _validate_squashfs_output(out_sq, unsq, ui_sha, ui_sz, extract_root, rep)
 
-    rep.status("[6/6] finalizing image (pad to partition size)")
-    _copyfile(out_sq, out_bin)
-    with open(out_bin, "r+b") as f:      # pad to exact partition size
-        f.truncate(IMG_SIZE)
+        rep.status("[6/6] finalizing image (pad to partition size)")
+        _copyfile(out_sq, out_bin)
+        with open(out_bin, "r+b") as f:      # pad to exact partition size
+            f.truncate(IMG_SIZE)
 
-    import hashlib as _h
-    md5 = _h.md5(open(out_bin, "rb").read()).hexdigest()
-    rep.ok(f"image built: {out_bin} ({os.path.getsize(out_bin)} bytes) md5={md5}")
-    return out_bin
+        import hashlib as _h
+        md5 = _h.md5(open(out_bin, "rb").read()).hexdigest()
+        rep.ok(f"image built: {out_bin} ({os.path.getsize(out_bin)} bytes) md5={md5}")
+        return out_bin
 
 
 def _grep1(path, pattern):
