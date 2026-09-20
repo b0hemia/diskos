@@ -10,18 +10,18 @@
 </p>
 
 <p align="center">
-  <a href="#install"><img alt="Platform: Linux x86-64" src="https://img.shields.io/badge/platform-Linux%20x86__64-3D424B?style=flat-square"></a>
+  <a href="#host-support"><img alt="Flash-tested platform: Linux x86-64" src="https://img.shields.io/badge/platform-Linux%20x86__64-3D424B?style=flat-square"></a>
   <a href="#whats-proven-vs-beta"><img alt="Status: beta" src="https://img.shields.io/badge/status-beta-B99AC8?style=flat-square"></a>
   <a href="LICENSE"><img alt="Installer license: MIT" src="https://img.shields.io/badge/installer-MIT-D77868?style=flat-square"></a>
   <a href="https://ko-fi.com/b0hemia"><img alt="Support diskOS on Ko-fi" src="https://img.shields.io/badge/Ko--fi-support%20diskOS-FF5E5B?style=flat-square&logo=ko-fi&logoColor=white"></a>
 </p>
 
 <p align="center">
-  <a href="#see-diskos">Screenshots</a> ·
-  <a href="#install">Install</a> ·
-  <a href="#restore-stock--recover">Restore</a> ·
-  <a href="#known-issues">Known issues</a> ·
-  <a href="#documentation">Docs</a> ·
+  <a href="#see-diskos">Screenshots</a> |
+  <a href="#install">Install</a> |
+  <a href="#restore-stock--recover">Restore</a> |
+  <a href="#known-issues">Known issues</a> |
+  <a href="#documentation">Docs</a> |
   <a href="#contributing">Contribute</a>
 </p>
 
@@ -33,25 +33,33 @@
 > on separate storage before installing.
 
 diskOS is a custom player UI/firmware for the **FiiO Snowsky Disc** digital audio player
-(Ingenic X2000). It replaces the stock interface and uses a source-run installer to build a diskOS
-image locally from **your own official FiiO firmware**, then flashes it over the chip's mask-ROM USB
-mode. No FiiO root filesystem is distributed by this project.
+(Ingenic X2000). It replaces the stock interface while keeping the stock audio engine, and uses a
+source-run installer to build a diskOS image locally from **your own official FiiO firmware**, then
+flashes it over the chip's mask-ROM USB mode. No FiiO root filesystem is distributed by this project.
 
 The installer and build tooling in this repository are open source under the MIT license. The
 on-device UI source lives in [`ui/`](ui/) and is licensed separately under **GPL-3.0-or-later** (its built
 artifact, `payload/mq_ui`, is what the installer bakes into the image); see [License](#license) for
 the boundary.
 
+**v1.1.1 fixes image builds on the default macOS filesystem** by automatically using a temporary
+case-sensitive volume. Device flashing from macOS remains unverified end to end.
+
+This builds on v1.1.0's V2.40 firmware support and refreshed listening interface: album cover flow,
+a separate Books view with saved progress, folder browsing, Latin-extended, Greek, and Cyrillic
+library text, and safer selection of USER EQ presets changed on the stock player.
+
 ## At a glance
 
 | | |
 |---|---|
 | **Device** | FiiO Snowsky Disc |
+| **Current release** | v1.1.1 |
 | **Project status** | Beta; field testing is still limited |
 | **Released host** | Linux x86-64 |
-| **macOS** | Build path exists; artifact and device flash are unverified |
+| **macOS** | Image builds tested on the default filesystem; device flashing remains unverified |
 | **Flash-tested stock firmware** | V2.09, V2.28, and V2.40 |
-| **Typical flash time** | about 15 minutes, including verification |
+| **Typical flash time** | About 15 minutes, including verification |
 | **Return to stock** | Saved-image restore, temporary stock boot, or stock UI as default |
 
 Not affiliated with or endorsed by FiiO, Snowsky, or Ingenic. No warranty or support is promised.
@@ -60,20 +68,26 @@ Not affiliated with or endorsed by FiiO, Snowsky, or Ingenic. No warranty or sup
 
 <table>
   <tr>
-    <td align="center"><img src="docs/assets/home.png" alt="diskOS home screen" width="240"><br><sub>Home</sub></td>
+    <td align="center"><img src="docs/assets/coverflow.png" alt="diskOS horizontal album cover flow with reflections" width="240"><br><sub>Album cover flow</sub></td>
     <td align="center"><img src="docs/assets/now-playing.png" alt="diskOS now playing screen" width="240"><br><sub>Now playing</sub></td>
-    <td align="center"><img src="docs/assets/library.png" alt="diskOS music library" width="240"><br><sub>Library</sub></td>
   </tr>
   <tr>
-    <td align="center"><img src="docs/assets/alphabet.png" alt="diskOS alphabet navigation" width="240"><br><sub>Fast navigation</sub></td>
-    <td align="center"><img src="docs/assets/apps.png" alt="diskOS apps screen" width="240"><br><sub>Apps</sub></td>
+    <td align="center"><img src="docs/assets/library.png" alt="diskOS music library" width="240"><br><sub>Library</sub></td>
+    <td align="center"><img src="docs/assets/folders.png" alt="diskOS file and folder browser" width="240"><br><sub>Folder browser</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/assets/home.png" alt="diskOS home screen" width="240"><br><sub>Home</sub></td>
     <td align="center"><img src="docs/assets/eq.png" alt="diskOS custom equalizer" width="240"><br><sub>Custom EQ</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="docs/assets/search.png" alt="diskOS library search" width="240"><br><sub>Search</sub></td>
+    <td align="center"><img src="docs/assets/apps.png" alt="diskOS apps screen" width="240"><br><sub>Apps</sub></td>
   </tr>
 </table>
 
 <p align="center">
-  <img src="docs/assets/boot-animation.gif" alt="Premium diskOS boot animation concept" width="320">
-  <br><sub>Premium boot concept: clockwise from the lower-left, matching the real seek-ring geometry.</sub>
+  <img src="docs/assets/boot-animation.gif" alt="diskOS boot animation concept" width="320">
+  <br><sub>Boot animation concept: clockwise from the lower-left, matching the real seek-ring geometry.</sub>
 </p>
 
 ### Built around the Disc
@@ -81,11 +95,39 @@ Not affiliated with or endorsed by FiiO, Snowsky, or Ingenic. No warranty or sup
 | For listening | For tinkering |
 |---|---|
 | Circular UI designed for the round display | Graphical and command-line installer |
-| Bezel scrolling and alphabet navigation | Image built locally from your stock firmware |
-| M3U playlist import | Bad-block-aware writer with block verification |
+| Album cover flow with swipe navigation and reflections | Image built locally from your stock firmware |
+| Dedicated Books view for `.m4b` audiobooks with saved progress | V2.09, V2.28, and V2.40 firmware support |
+| File/folder browsing to find and play library tracks | Bad-block-aware writer with block verification |
+| Bezel scrolling and alphabet navigation | Writer capacity checked before any NAND write |
+| M3U playlist import | Saved-stock restore, including older short backups |
 | Dynamic colors derived from album art | Opt-in SSH debug mode, off by default |
-| Local playback as the well-tested path | Hardware map and reverse-engineering notes |
-| Weather and Last.fm integrations *(experimental)* | Stock UI fallback and restore path |
+| Latin-extended, Greek, and Cyrillic library text | On-device UI source under GPL-3.0-or-later |
+| Custom EQ that preserves stock-edited USER presets on reselection | Hardware map and reverse-engineering notes |
+| Local playback as the well-tested path | Stock UI fallback and restore path |
+| Weather and Last.fm integrations *(experimental)* | Installer and build tooling under MIT |
+
+**Album cover flow** turns the album library into a horizontal wall with a centered cover,
+angled side covers, and faded reflections. Swipe to browse, tap the center album to play, or
+long-press it to open its tracks. Covers and reflections are pre-baked into sprites and cached
+in a small moving window, with album lists sized to the library. This is designed to accommodate
+thousands of albums without keeping every cover in memory. Albums without cached art show a
+placeholder.
+
+**Books** gives single-file `.m4b` audiobooks a dedicated view with saved listening positions.
+They are separated from the music library and music queues, including existing library entries
+migrated during an upgrade. Open a book to continue listening from its saved progress.
+
+**Files** provides the familiar stock-style route through the microSD card's folder tree.
+Browse folders and tap an indexed music file to play it. Playback uses the all-songs queue;
+selecting a file does not create a queue for that folder.
+
+**Multilingual library text** uses bundled Noto Sans glyphs for Latin-extended, Greek, and
+Cyrillic names, so supported filenames and metadata render instead of missing-character boxes.
+This expands text coverage; full interface localization is not included.
+
+**Safer custom EQ** checks the current stock curve against diskOS's saved settings before writing
+it back. Reselecting a USER preset preserves changes made on the stock player. Advanced parametric
+presets that the graphic editor cannot represent are protected from slider edits.
 
 ## Install
 
@@ -95,6 +137,8 @@ Not affiliated with or endorsed by FiiO, Snowsky, or Ingenic. No warranty or sup
 
 ### First-time setup
 
+Run these commands from the installer directory.
+
 The installer runs with your own **Python 3.8+**. The setup script creates a local virtual
 environment and installs two Python dependencies into it; nothing is installed system-wide.
 
@@ -102,7 +146,7 @@ environment and installs two Python dependencies into it; nothing is installed s
 ./install.sh
 ```
 
-The setup check will tell you if either optional system component is missing:
+The setup check will tell you if either system component is missing:
 
 - **Tk / tkinter:** needed only by the graphical installer. Debian/Ubuntu:
   `sudo apt install python3-tk`
@@ -146,6 +190,12 @@ Useful recovery and cleanup commands:
 ./diskos-installer remove
 ```
 
+`restore-stock` acts on the player. `remove` cleans up the installer's files on the host, including
+saved recovery files; restore first if needed and keep a separate copy of your saved stock image.
+
+Updating diskOS also requires a flash. Use the complete v1.1.1 installer and its matching flash
+tools, supply your official firmware archive, and follow the same installation steps.
+
 ## Requirements
 
 - A **FiiO Snowsky Disc** with supported stock firmware.
@@ -154,7 +204,8 @@ Useful recovery and cleanup commands:
 - A reliable USB cable and about 15 uninterrupted minutes.
 - **Python 3.8+** and the dependencies installed by `./install.sh`.
 - USB access to mask-ROM device `a108:eaef`.
-- **Linux x86-64** for the released path. macOS support remains unverified.
+- **Linux x86-64** for the path tested through device flashing. macOS image builds are tested;
+  see [Host support](#host-support) for the remaining limitation.
 
 Do **not** run the installer with `sudo`. Its saved recovery image and state belong under your user
 account. On Linux, install the included udev rule once instead:
@@ -169,25 +220,36 @@ The build, save, and flash then run as one unprivileged process.
 
 ### Host support
 
-- **Linux x86-64:** released and tested end to end.
-- **macOS, Apple Silicon and Intel:** source is macOS-aware, but there is no verified release
-  artifact yet. Build on a Mac with `build/build-macos.sh` after installing libusb with Homebrew.
-  Run it from a **case-sensitive volume.** macOS is case-insensitive by default, and the stock
-  firmware contains files that differ only in case, so extracting it on a case-insensitive
-  filesystem can silently corrupt the built image. Point `DISKOS_INSTALLER_HOME` at a
-  case-sensitive volume (create one in Disk Utility, or a case-sensitive APFS sparse image),
-  since the build and extraction use that workspace. Treat the entire path as unverified until a
-  real-device flash succeeds.
+- **Linux x86-64:** released and tested end to end on hardware with V2.09, V2.28, and V2.40.
+- **macOS, Apple Silicon and Intel:** a build-from-source path is available through
+  `build/build-macos.sh` after installing libusb with Homebrew. **Image builds now succeed on the
+  default case-insensitive macOS filesystem.** The installer automatically creates and mounts a
+  case-sensitive APFS scratch image using `hdiutil`, verifies its case sensitivity, and uses it for
+  rootfs extraction and validation. It detaches the volume and removes the scratch image
+  automatically afterward, reporting cleanup failures if they occur. No manual volume setup or
+  `DISKOS_INSTALLER_HOME` change is needed for a normal build.
+  **Device flashing from macOS remains unverified end to end:** no flash with a device attached
+  to a Mac has been completed.
+
+The macOS fix resolves the E230 `unsquashfs ... already exists` failure caused by stock files whose
+names differ only in case. On real macOS, `back_home.png` and `BACK_HOME.png` now coexist in the
+extracted filesystem. The scratch-volume mechanism leaves the existing build path unchanged on
+Linux with a case-sensitive filesystem and on case-sensitive macOS volumes.
 
 ## Restore stock & recover
 
 `restore-stock` reflashes the checksum-verified stock root filesystem reconstructed and saved during
-installation. It deactivates diskOS, but it is not a factory wipe; inactive files under `/usr/data`
+installation. This is built from your official firmware archive, not a dump of the device's original
+partition. It deactivates diskOS, but it is not a factory wipe; inactive files under `/usr/data`
 remain until you remove them.
+
+Older, shorter saved stock images remain usable: restore creates a copy padded to the current
+768-block image size, then validates it before flashing. Keep your saved stock image on separate
+storage.
 
 You can also switch without reflashing:
 
-- **Persistently:** Settings → System → Default UI → Stock
+- **Persistently:** Settings > System > Default UI > Stock
 - **Once:** hold **Volume Up** during power-on
 
 If a flash fails, the root filesystem can be left partially written. In tested cases, the device
@@ -199,11 +261,15 @@ flashed code runs, but recovery is still **not guaranteed** for every unit or fa
 
 | Status | Area | Current evidence |
 |---|---|---|
-| ✅ | Flash mechanism and image build | Used on real hardware; writer skips factory bad blocks and verifies every block |
-| ✅ | Firmware extraction | Reproduces the stock root filesystem byte for byte from FiiO's archive |
-| ✅ | Linux x86-64 | Builds and flashes end to end |
-| ⚠️ | macOS | Build recipe exists; artifact and real-device flash are unverified |
-| ⚠️ | Firmware coverage | V2.09, V2.28, and V2.40 are flash-tested; other versions are refused by default |
+| Tested | Flash mechanism and image build | Used on real hardware; writer skips factory bad blocks and verifies every block |
+| Tested | Firmware extraction | Reproduces the stock root filesystem byte for byte from FiiO's archive |
+| Tested | Linux x86-64 | Builds and flashes end to end on hardware with V2.09, V2.28, and V2.40 |
+| Tested | macOS image builds | Builds succeed on the default case-insensitive filesystem; case-colliding stock files coexist |
+| Unverified | macOS device flashing | No end-to-end flash with a device attached to a Mac yet |
+| Limited | Firmware coverage | V2.09, V2.28, and V2.40 are flash-tested; other versions are refused by default |
+
+Local music playback is the well-tested listening path. Weather and Last.fm remain experimental;
+hardware flash testing does not imply that every feature or mode has been verified.
 
 The Disc uses **Winbond W63AH6NKB LPDDR3**, the DRAM initialized by its stock bootloader. If a future
 hardware revision uses different DRAM, the writer is designed to fail at memory initialization and
@@ -213,11 +279,16 @@ leave the device mask-ROM-recoverable instead of continuing. Wide field testing 
 
 - **Firmware coverage:** only V2.09, V2.28, and V2.40 are currently flash-tested. Other command maps can
   differ and are refused by default.
+- **macOS flashing:** image builds are tested, but device flashing from a Mac remains unverified.
 - **Long flash:** a complete write and verification takes about 15 minutes. Most of the time is
   a conservative fixed wait; a faster writer is planned.
 - **No on-device update path:** updating diskOS currently requires another flash.
 - **microSD after cold boot:** the card mounts a few seconds after startup. If the library initially
   appears empty, reinsert the card once.
+- **Cover flow artwork:** albums without cached art show placeholders. Playing a track with artwork
+  lets diskOS populate its art cache.
+- **Folder playback:** a selected file must be in the library database. Unindexed files report
+  "Not in library". Playback uses the all-songs queue, not a folder-only queue.
 - **Lightly tested modes:** USB DAC, Bluetooth receiver, and USB storage have less coverage than
   local playback.
 - **USB-serial debug:** the dev variant's CDC-ACM serial shell can be unreliable. Prefer temporary
@@ -236,16 +307,23 @@ flowchart LR
     A[Official FiiO firmware ZIP] --> B[Local extraction and validation]
     C[diskOS UI payload] --> D[Build verified rootfs image]
     B --> D
-    D --> E[Ingenic mask-ROM USB]
+    B --> H[Saved stock image]
+    D --> E[Writer capacity check and mask-ROM USB]
     E --> F[Bad-block-aware write and verify]
     F --> G[diskOS first boot]
-    F -. saved image .-> H[Restore stock]
+    H --> I[Restore stock]
 ```
 
 diskOS adds a small hook to the stock `fiio_init.sh` that launches `mq_ui` instead of the stock UI.
 The stock root filesystem is read-only squashfs, so enabling the hook requires rewriting partition
 `mtd2`. On first boot, the embedded UI is copied to writable storage and checked against a baked
 SHA-256 manifest. If validation fails, the stock UI launches instead.
+
+The image uses **768 NAND blocks (96 MiB)** so V2.40's roughly 88 MB stock root filesystem fits.
+This capacity was increased from 580 blocks in v1.1.0 without changing the partition layout.
+Before any NAND write, the flasher checks that the writer's compiled capacity can cover the image
+and refuses an undersized or unrecognized writer. It also checks the reported capacity after the
+write, alongside the existing block verification.
 
 The device's normal update menu checks a signature this project cannot create, so installation uses
 mask-ROM USB. See [`docs/HARDWARE.md`](docs/HARDWARE.md) for the partition map and hardware details.
@@ -271,13 +349,23 @@ mask-ROM USB. See [`docs/HARDWARE.md`](docs/HARDWARE.md) for the partition map a
 ## For developers
 
 A prepared release bundle includes native host tools under `vendor/<os>-<arch>/`. A fresh source
-checkout does not include those large binaries, so build them once:
+checkout does not include those large binaries, so build them once.
+
+On Linux:
 
 ```bash
 bash build/build-usbboot-static.sh
 bash build/build-squashfs-static.sh
-bash build/build-macos.sh              # run on macOS
 ```
+
+On macOS:
+
+```bash
+bash build/build-macos.sh
+```
+
+The macOS script also builds a standalone installer. See
+[`build/README-vendor.md`](build/README-vendor.md) for native tool and packaging details.
 
 You can optionally create a self-contained binary. This is not the normal release format and
 bundles many system libraries; review [`licenses/THIRD_PARTY_BUNDLED.md`](licenses/THIRD_PARTY_BUNDLED.md)
@@ -302,7 +390,7 @@ cd ui && make    # toolchain as mipsel-linux-musl-gcc; or: make CROSS=/path/to/m
 <details>
 <summary><strong>Optional SSH access and security notes</strong></summary>
 
-Debug Mode is **off by default**. Open **Settings → System → Debug Mode → Enable Debug** to show an
+Debug Mode is **off by default**. Open **Settings > System > Debug Mode > Enable Debug** to show an
 SSH command and a newly generated password. The password rotates each time Debug Mode is enabled.
 
 While enabled, the password is stored in plaintext at `/usr/data/sshd/current_pw` with mode `0600`
@@ -327,14 +415,18 @@ written even when the writer fails closed.
 | **E1xx** | Environment or preflight; nothing was written |
 | E101-E103 | Unsupported host, missing component, or tool cannot run |
 | E110-E112 | Mask-ROM device detection or permission problem |
-| E120-E142 | Image, firmware ZIP, saved stock image, or state-directory problem |
+| E120-E122 | Image missing, wrong size, or not a squashfs |
+| E123 / E124 | Writer capacity cannot be verified or is too small; refused before any NAND write |
+| E140-E142 | Firmware ZIP, saved stock image, or state-directory problem |
 | **E2xx** | Firmware extraction and image build |
 | E201-E224 | Unsafe archive, OTA manifest, decrypt, rootfs, version, payload, or hash problem |
-| E230-E250 | Squashfs build, size, validation, symlink, partition, or variant problem |
+| E230-E250 | Squashfs extraction/build, size, validation, filesystem, symlink, partition, or variant problem |
+| E234 | Build filesystem could not be verified as case-sensitive, or scratch-volume setup failed; see the accompanying message |
 | **E3xx** | Host-side flashing |
 | E301 / E302 | Missing or truncated result; outcome unknown |
 | E303 | Flash timed out |
 | E310 | Device reported a verification failure |
+| E311 | Writer capacity reported after flashing does not match the image; treat the flash as failed |
 | **F1xx** | Device writer aborted; return to mask-ROM and reflash or restore |
 
 Process exit codes are `0` success, `1` error, `2` usage or preflight refusal, `3` cancelled, and
@@ -348,10 +440,22 @@ Bug reports, hardware findings, documentation fixes, and carefully scoped patche
 Read [`CONTRIBUTING.md`](CONTRIBUTING.md) before changing flashing code or security-sensitive paths.
 Report vulnerabilities privately according to [`SECURITY.md`](SECURITY.md).
 
+## Acknowledgements
+
+Thanks to the people who contributed reports, tools, and fixes:
+
+- **[eudj1n](https://github.com/eudj1n)** reported the V2.40 image-size issue
+  ([#1](https://github.com/b0hemia/diskos/issues/1)) with a byte-exact stock rootfs reproduction,
+  reported the Cyrillic rendering issue ([#3](https://github.com/b0hemia/diskos/issues/3)),
+  and built a QEMU preview harness.
+- **Pierre Nel ([@pierrenel](https://github.com/pierrenel))** contributed the macOS
+  case-insensitive-filesystem fix ([PR #2](https://github.com/b0hemia/diskos/pull/2)).
+
 ## Support the project
 
-diskOS is a solo open-source hobby project. Tips are optional, but they help keep testing,
-reverse-engineering, documentation, and release work moving.
+diskOS is an open-source hobby project maintained by b0hemia, with community contributions.
+Tips are optional, but they help keep testing, reverse-engineering, documentation, and release
+work moving.
 
 <p align="center">
   <a href="https://ko-fi.com/b0hemia">
