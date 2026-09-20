@@ -450,6 +450,9 @@ Thanks to the people who contributed reports, tools, and fixes:
   and built a QEMU preview harness.
 - **Pierre Nel ([@pierrenel](https://github.com/pierrenel))** contributed the macOS
   case-insensitive-filesystem fix ([PR #2](https://github.com/b0hemia/diskos/pull/2)).
+- **[zmd22](https://github.com/zmd22)** corrected the V2.40 `0657` work-mode command table from
+  hardware testing ([discussion #6](https://github.com/b0hemia/diskos/discussions/6)) and shared
+  UI customizations ([discussion #5](https://github.com/b0hemia/diskos/discussions/5)).
 
 ## Support the project
 

@@ -5,12 +5,25 @@ Confidence: **V**=string-verified · **I**=inferred from family · **U**=unknown
 ⚠ = static reading conflicts with our 1.95-era LIVE tests (trust live; V2.09 meanings need live re-verify).
 
 ## SOURCE / WORK-MODE SWITCH - 0657 (corrected; supersedes "close player" reading)
-`0657` = switch audio SOURCE, payload = integer mode index (jump table @0x6736b0). Frame = `0657000C000<hex>`:
-- `0657000C0001` = **LOCALPLAYER** (safe recover)  ·  `0657000C0009` = **USB-DAC (UAC)**  ·  `0657000C000C` = **BTSINK**
-- **Network receivers (AirPlay/DLNA/Roon):** `0657000C0008` PLUS companion `0642000C000X` (NETWORK_MODE selector, X in {0,1,2,5}; exact AirPlay value UNMAPPED). Prereq: WLAN up.
+`0657` = switch audio SOURCE, payload = integer mode index (jump table @0x6736b0). Frame = `0657000C000<hex>`.
+Full mode table, confirmed on V2.40 hardware by zmd22 ([discussion #6](https://github.com/b0hemia/diskos/discussions/6)):
+
+| Frame | Mode | Result |
+|---|---|---|
+| `0657000C0001` | 01 | USB DAC |
+| `0657000C0002` | 02 | Optical out |
+| `0657000C0006` | 06 | Bluetooth sink |
+| `0657000C0007` | 07 | Bluetooth streaming |
+| `0657000C0008` | 08 | **Local playback** (the safe recovery frame; diskOS sends this) |
+| `0657000C0009` | 09 | Roon |
+| `0657000C000A` | 0A | **AirPlay** (RAOP listener on port 5000) |
+| `0657000C000B` | 0B | AirPlay + DLNA (5000 and 33291) |
+| `0657000C000C` | 0C | DLNA (49494) |
+
+Key corrections over the earlier guess: `08` is **local playback**, not a network-receiver mode (which is why "mode 8" always returned to normal playback and AirPlay could never be triggered); `09` is **Roon**; `01` is **USB DAC**. The safe local-recovery frame is `0657000C0008`, which diskOS's runtime already sends. The network-receiver modes need no `0642` companion (a plain `0657` switch is enough). `0642` itself is the USB-gadget selector used by the local / USB-DAC / storage modes (see main.c), not a network-receiver control; `NETWORK_MODE` in `SYSCONFIG` stays `0` throughout. Network receivers need WLAN up.
 - ✅ **PRE-STOP PINNED + CONFIRMED (2026-08-03, live strace of stock mq_ui + fixed on device):** the pre-stop is **`0666000C0006`** (out_dev=6, local). Stock always sends it BEFORE `0666000C0002` (route to BT). Skipping it = the **g_fiio_local trap** → mq_player SIGSEGV → SD freed → MCU reboot. Mechanism: direct→2 can leave shadow-out=2 with DAC-flag=1 (split state); 6→2 normalizes DAC-flag=0. **This was THE cause of every BT-route reboot.** See "BT AUDIO OUTPUT" section below.
-- ⚠ AirPlay discovery CANNOT be tested on an iPhone Personal Hotspot (client/mDNS isolation) - needs a normal router. PARKED pending router + 0666 pre-stop.
-NB: this 0657 is the V2.09 SOURCE switch; the 1.95 "0657=play-mode" was a different binary/table. Our earlier play-mode toggle using 0657 on V2.09 was therefore WRONG (it sent source-switch values) - FIXED 2026-06-25 (now uses 0102, below).
+- AirPlay (mode 0A) is confirmed working on V2.40 (receiver discoverable and plays); it needs a normal router, not an iPhone Personal Hotspot (client/mDNS isolation).
+NB: table confirmed on V2.40; the 1.95 "0657=play-mode" was a different binary/table. Our earlier play-mode toggle using 0657 was WRONG (it sent source-switch values) - FIXED 2026-06-25 (now uses 0102, below).
 
 ## PLAY-MODE - 0102 (GROUND TRUTH, captured from stock UI 2026-06-25)
 `0102` = LOCAL play-mode setter. Frame = `0102000C000<v>`. Captured by strace'ing the stock
@@ -47,7 +60,7 @@ Captured from a live strace of stock mq_ui doing a working transmit, then replic
 Working route-to-BT sequence (diskOS, MAC = the connected speaker, uppercased):
 ```
 0666000C0006   PRE-STOP: switch output to LOCAL first (MANDATORY - skip = g_fiio_local crash → MCU reboot)
-0642000C0000   reset network/output mode
+0642000C0000   reset USB gadget selector to local/no-export
 0657000C0008   work-mode 8
 06c1000C0000   start player BT-init thread (06b3 no-ops until this completes; async on cold start)
 0666000C0002   route: out_dev = BT source
