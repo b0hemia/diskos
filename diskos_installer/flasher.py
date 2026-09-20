@@ -46,15 +46,16 @@ def _probe_helpers():
               (bundle.native("unsquashfs"), ["-version"])]
     for path, args in probes:
         try:
-            subprocess.run([path] + args, env=bundle.native_env(),
+            subprocess.run([path] + args, env=bundle.native_env(path),
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=15)
         except OSError as e:
             raise FlashError(
-                f"bundled helper '{os.path.basename(path)}' cannot execute ({e})",
+                f"native tool '{os.path.basename(path)}' at '{path}' cannot execute ({e})",
                 code="E103",
                 action="the tool's directory may be on a noexec mount, or a required library is "
-                       "missing; move the installer to an exec-capable filesystem and retry")
+                       "missing; move the installer to an exec-capable filesystem, install "
+                       "squashfs-tools, or rebuild the bundled tools, and retry")
         except subprocess.TimeoutExpired:
             pass   # it started (that's all we needed to prove)
 
@@ -189,7 +190,7 @@ def flash(image_path, log_path=None, rep=None):
                 # own session so a GUI/parent crash can't SIGPIPE the flasher; output goes
                 # to a file (never a pipe) so a closed reader can't deadlock or kill it.
                 proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT,
-                                        env=bundle.native_env(), start_new_session=True)
+                                        env=bundle.native_env(cmd[0]), start_new_session=True)
 
                 def _kill_flasher():
                     # The flasher runs in its OWN session (start_new_session) so a parent SIGPIPE

@@ -30,6 +30,9 @@ PINNED_ROOTFS = {
     "228": ("0ffd877bca2c69ddff9ca70f4494da0d9e580c18d0f587e2c6d9921f2db82bd2", 72957952),
     "209": ("f1e3c69fb0e88b923c135558e01f4387a661f68839c8118e8ad490bdc9fc74e6", 75919360),
     "240": ("b479e159db5134325819b5f6e5a54388f3adefae373a4ee60680f02d5dcf0bb8", 88420352),
+    # V2.57 pinned but NOT yet in TESTED_FW: a build on it needs DISKOS_ALLOW_UNTESTED_FW=1 and stays
+    # unqualified until on-device init/artwork/BT/gain/USB-DAC testing passes (fits the 768-block image).
+    "257": ("111e4dd7ee3d7ff91ba7e61181690be7ffd22bd1bbd13ad513f5f015ffb302ae", 80596992),
 }
 # Firmware versions diskOS has been flash-tested against. Others have DIFFERENT command-tag
 # meanings, so diskOS built on them can send wrong commands and misbehave/reboot.
@@ -53,9 +56,19 @@ def validate_stock_rootfs(stock_squashfs, rep=None):
             raise BuildError("not a squashfs image (bad magic) - not a Snowsky Disc rootfs", code="E220")
     tmp = tempfile.mkdtemp(prefix="diskos-vchk-")
     try:
-        _run([unsq, "-d", os.path.join(tmp, "x"), "-f", stock_squashfs,
-              "etc/product_version/version.in"], capture_output=True, text=True)
+        r = _run([unsq, "-d", os.path.join(tmp, "x"), "-f", stock_squashfs,
+                  "etc/product_version/version.in"], capture_output=True, text=True)
         ver_in = os.path.join(tmp, "x", "etc/product_version/version.in")
+        if not os.path.exists(ver_in):
+            # The file we need was NOT extracted (e.g. unsquashfs without LZO, or not a readable
+            # rootfs) - report that plainly rather than mislabeling it as a wrong-PRODUCT rootfs
+            # below. Keyed on the file's presence, not on returncode: unsquashfs can exit nonzero
+            # (status 2) for a metadata-setting warning while still writing the file correctly.
+            raise BuildError(
+                f"could not extract version.in from the stock rootfs using '{unsq}': "
+                f"{(r.stderr or r.stdout or '').strip()[:300]}", code="E230",
+                action="check the firmware image and that unsquashfs supports LZO "
+                       "(install squashfs-tools with LZO support, or use the bundled tools)")
         prod = _grep1(ver_in, r"PRODUCT=([A-Za-z0-9_]+)")
         mver = _grep1(ver_in, r"MAIN_OS_VER=([0-9]+)")
     finally:
@@ -334,7 +347,70 @@ def _validate_ui_elf(ui_path):
 
 
 def _run(cmd, **kw):
-    return subprocess.run(cmd, env=bundle.native_env(), **kw)
+    # cmd[0] is the resolved tool path; native_env tailors the loader path to whether
+    # that tool is bundled (gets vendor/lib) or a system copy (clean env).
+    return subprocess.run(cmd, env=bundle.native_env(cmd[0]), **kw)
+
+
+def check_squashfs_tools(mksq, unsq, rep=None):
+    """Prove the resolved squashfs tools can actually PACK and EXTRACT with the exact
+    stock LZO parameters, BEFORE the real build touches the firmware. A system mksquashfs
+    built without LZO (or an otherwise broken tool) fails here with a clear, actionable
+    message instead of a cryptic mid-build error. Applies to bundled and system tools
+    alike. A failure is reported as an LZO CAPABILITY failure (it can also be caused by
+    disk space, permissions, resource limits or missing libraries), never asserted as
+    'built without LZO'. Raises BuildError E104 on any failure."""
+    import tempfile, filecmp
+    _script = bundle.native_build_script("squashfs")
+    _fixhint = ("diskOS requires working LZO compression and extraction; install squashfs-tools "
+                f"with LZO support, or repair/rebuild the bundled tools with {_script} from the "
+                "diskOS source")
+
+    def _fail(stage, path, detail):
+        detail = (detail or "").strip()[:300]
+        raise BuildError(
+            f"squashfs LZO capability check failed during {stage} using '{path}'"
+            + (f": {detail}" if detail else ""), code="E104", action=_fixhint)
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="diskos-sqcheck-") as td:
+            src = os.path.join(td, "src")
+            os.makedirs(src)
+            payload = os.path.join(src, "probe.bin")
+            # compressible, multi-block content (> one 128 KiB block) so the LZO data path runs
+            with open(payload, "wb") as f:
+                f.write(b"diskos-lzo-probe-0123456789abcdef" * 8192)   # ~256 KiB
+            sqfs = os.path.join(td, "probe.sqfs")
+            ext = os.path.join(td, "ext")
+
+            try:
+                pack = _run([mksq, src, sqfs, "-comp", "lzo", "-b", "131072", "-no-xattrs",
+                             "-all-root", "-noappend", "-processors", "1"],
+                            capture_output=True, text=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                _fail("pack", mksq, str(e))
+            if pack.returncode != 0 or not os.path.exists(sqfs):
+                _fail("pack", mksq, (pack.stderr or "") + (pack.stdout or ""))
+            try:
+                unp = _run([unsq, "-processors", "1", "-d", ext, sqfs],
+                           capture_output=True, text=True, timeout=120)
+            except (OSError, subprocess.TimeoutExpired) as e:
+                _fail("extract", unsq, str(e))
+            if unp.returncode != 0:
+                _fail("extract", unsq, (unp.stderr or "") + (unp.stdout or ""))
+            out = os.path.join(ext, "probe.bin")
+            if not os.path.exists(out) or not filecmp.cmp(payload, out, shallow=False):
+                raise BuildError(
+                    "squashfs LZO capability check failed: pack/extract round-trip bytes differ",
+                    code="E104", action=_fixhint)
+    except OSError as e:
+        # the scratch dir / payload write / compare / cleanup failed (e.g. ENOSPC, EACCES) -
+        # translate to a coded, actionable error rather than an uncoded OSError.
+        raise BuildError(
+            f"squashfs LZO capability check could not run: {e}", code="E104",
+            action="check free disk space and temp-dir permissions and retry; " + _fixhint)
+    if rep:
+        rep.log("squashfs LZO pack/extract check: OK")
 
 
 # --- case-sensitive scratch space (macOS) ------------------------------------
@@ -549,6 +625,9 @@ def build_image(stock_squashfs, ui_binary, variant, out_bin, workdir, rep=None):
 
     unsq = bundle.native("unsquashfs")
     mksq = bundle.native("mksquashfs")
+    # Prove the resolved squashfs tools can pack+extract with the stock LZO params BEFORE
+    # unpacking the firmware - so a system tool without LZO fails cleanly, not mid-build.
+    check_squashfs_tools(mksq, unsq, rep)
     with _case_sensitive_extract_root(workdir, rep) as extract_root:
         rf = os.path.join(extract_root, "rf")
         if os.path.isdir(rf):

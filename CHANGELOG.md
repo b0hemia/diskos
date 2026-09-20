@@ -5,6 +5,25 @@ All notable changes to diskOS are documented here.
 Entries follow the Keep a Changelog format, with Added, Changed, and Fixed categories where applicable.
 diskOS remains beta software; version numbers do not imply broad hardware or feature validation.
 
+## [1.1.2] - 2026-09-20
+
+### Fixed
+
+- Install now works from a plain source checkout that does not include the bundled squashfs tools:
+  the installer uses a system `mksquashfs`/`unsquashfs` from `PATH` (for example from the
+  `squashfs-tools` package) when the vendored copies are absent. `usbboot` and the device files
+  remain bundle-only. Previously a source checkout failed with "bundled tool 'unsquashfs' not found"
+  even when squashfs-tools was installed.
+- Added a squashfs LZO capability check that runs before the build and in `doctor`, so a squashfs
+  tool built without LZO support fails with a clear, actionable message instead of failing partway
+  through the build.
+
+### Changed
+
+- `doctor` now labels each native tool as bundled or system, flags broken entries, and reports the
+  squashfs LZO check result. Tool-not-found guidance points at the correct per-platform build step
+  instead of advising a re-download.
+
 ## [1.1.1] - 2026-09-20
 
 ### Fixed
@@ -75,6 +94,7 @@ diskOS remains beta software; version numbers do not imply broad hardware or fea
 - MIT-licensed installer tooling, recovery documentation, hardware notes, and third-party notices.
   The initial release distributed the UI as a binary; UI source publication followed in v1.1.0.
 
+[1.1.2]: https://github.com/b0hemia/diskos/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/b0hemia/diskos/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/b0hemia/diskos/compare/v1.0.0-beta...v1.1.0
 [1.0.0-beta]: https://github.com/b0hemia/diskos/releases/tag/v1.0.0-beta

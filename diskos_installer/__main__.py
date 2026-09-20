@@ -79,12 +79,36 @@ def cmd_doctor(args):
     ui.info(f"host       : {o}-{a} ({'supported' if platform_probe.is_supported() else 'UNSUPPORTED'})")
     ui.info(f"state dir  : {state.state_dir()}")
 
-    ui.info("bundled tools:")
+    def _tool_ok(path, need_exec):
+        try:
+            return (os.path.isfile(path) and os.access(path, os.R_OK)
+                    and (not need_exec or os.access(path, os.X_OK)))
+        except OSError:
+            return False
+
+    ui.info("native tools and device files:")
     all_ok = True
     for name in ("usbboot", "mksquashfs", "unsquashfs", "my_write5_dram.bin", "disc_spl_lpddr3.bin"):
         p = bundle.native(name, required=False)
-        (ui.ok if p else ui.err)(f"  {name}: {p or 'MISSING'}")
-        all_ok = all_ok and bool(p)
+        need_exec = not name.endswith(".bin")
+        ok = bool(p) and _tool_ok(p, need_exec)
+        if ok:
+            ui.ok(f"  {name}: {p} ({'bundled' if bundle.is_vendored(p) else 'system'})")
+        elif p:
+            ui.err(f"  {name}: BROKEN ({p}) - not a readable{'/executable' if need_exec else ''} file")
+        else:
+            ui.err(f"  {name}: MISSING")
+        all_ok = all_ok and ok
+    # squashfs tools may be bundled OR system copies - prove the actual pair can pack+extract LZO.
+    mksq = bundle.native("mksquashfs", required=False)
+    unsq = bundle.native("unsquashfs", required=False)
+    if mksq and unsq:
+        try:
+            imagebuild.check_squashfs_tools(mksq, unsq)
+            ui.ok("  squashfs LZO pack/extract check: OK")
+        except Exception as e:
+            ui.err(f"  squashfs LZO pack/extract check: FAILED - {e}")
+            all_ok = False
     for name in ("mq_ui", "S97diskos_install", "S99usbserial", "diskos-debug.sh", "dropbearmulti"):
         p = bundle.data(name, required=False)
         (ui.ok if p else ui.err)(f"  {name}: {p or 'MISSING'}")
