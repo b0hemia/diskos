@@ -58,8 +58,10 @@ static void settings_event_cb(lv_event_t *e)
 
 static void pp_event_cb(lv_event_t *e)
 {
-    if (lv_event_get_code(e) == LV_EVENT_CLICKED)
+    if (lv_event_get_code(e) == LV_EVENT_CLICKED){
+        ui_defer_sleep();   /* a play/pause tap changes state -> don't let the sleep check race a stale read */
         ipc_send_cmd("0201000C0000");   /* play/pause toggle */
+    }
 }
 
 static lv_obj_t *make_label(lv_obj_t *parent, const char *text,
@@ -301,7 +303,7 @@ void home_create(lv_obj_t *root)
     lv_obj_set_style_transform_rotation(handle, 450, 0);
 
     /* Library is the primary action: a full-width pill. Apps + Settings live on
-     * the swipe-left panel (SCR_HOME2). */
+     * the swipe-left panel (SCR_APPS). */
     make_pill(root, 80, 162, 200, 52, LV_SYMBOL_DIRECTORY, "Library",
               nav_event_cb, (void *)(uintptr_t)SCR_LIBRARY);
 

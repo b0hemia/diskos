@@ -8,13 +8,17 @@
 /* Verified RE data points (see RE_CATALOGUE / the V228 delta):
  *   V2.09  gain set = tag 0645   (no 0649 handler)
  *   V2.28  gain set = tag 0649   (the 0645 handler is a NULL pointer -> silent no-op)
- * We have RE data ONLY at these two versions, so we map them EXACTLY and fail closed on anything
- * else (unknown/unreadable version -> send no gain command) rather than guessing a tag that might
- * hit an unrelated handler. Each new firmware is gain-tested on-device before publish; add its
- * verified {version, tag} entry here then. */
+ *   V2.40  gain set = tag 0649   (firmware audit 2026-09-05: on the v2.40 player, 0649 resolves
+ *                                 0x413930 -> callback 0x4e8654 = the gain setter; 0645 is a NULL
+ *                                 callback. Same tag as V2.28.)
+ * We map only versions with RE data and fail closed on anything else (unknown/unreadable version ->
+ * send no gain command) rather than guessing a tag that might hit an unrelated handler. Each new
+ * firmware is gain-tested on-device before publish; add its verified {version, tag} entry here then.
+ * NOTE: the v2.40 entry is RE-verified but the Low/High acoustic effect still wants an on-device check. */
 static const struct { int ver; const char *tag; } GAIN_MAP[] = {
     { 209, "0645" },
     { 228, "0649" },
+    { 240, "0649" },
 };
 
 static int parse_os_ver(void){
@@ -23,6 +27,13 @@ static int parse_os_ver(void){
     char line[128];
     int ver = 0;
     while(fgets(line, sizeof line, f)){
+        size_t ll = strlen(line);
+        if(!(ll && line[ll-1]=='\n') && ll == sizeof(line)-1){   /* overlong physical line -> drain + skip, so a
+                                                                  * padded/truncated value can't be read as a real
+                                                                  * MAIN_OS_VER and enable a wrong-firmware capability */
+            int c; while((c=fgetc(f))!=EOF && c!='\n'){}
+            continue;
+        }
         char *p = line;
         while(*p == ' ' || *p == '\t') p++;                 /* tolerate leading whitespace */
         if(strncmp(p, "MAIN_OS_VER=", 12) == 0){

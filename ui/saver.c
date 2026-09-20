@@ -99,7 +99,9 @@ static void vinyl_load_sharp_cover(void)
     char *a[] = { "sh", "-c",
                   "ffmpeg -y -loglevel quiet -i /usr/data/fiio/cover.jpg "
                   "-vf scale=360:360 -pix_fmt bgra -f rawvideo " VIN_TMP " 2>/dev/null", NULL };
+    ui_decode_lock();                   /* serialize with the NP + prewarm decoders (no two ffmpeg at once) */
     int rc = ui_run_bounded(a, 5000);   /* hard 5s cap; a hung ffmpeg is SIGKILLed, never blocks us */
+    ui_decode_unlock();
     size_t got = 0;
     if (rc == 0) {
         FILE *f = fopen(VIN_TMP, "rb");

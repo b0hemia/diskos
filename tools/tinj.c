@@ -55,7 +55,8 @@ static void emit(uint16_t type, uint16_t code, int32_t value)
 }
 static void syn(void) { emit(EV_SYN, SYN_REPORT, 0); }
 
-/* screen -> panel (180 rotation) */
+/* screen -> panel (180 rotation). Verified on-device with the UI's debug-dot: a tap sent for screen
+ * (x,y) registers at (360-x, 360-y), so this maps a screen coordinate to the panel coordinate to send. */
 static int fx(int x) { return 360 - x; }
 static int fy(int y) { return 360 - y; }
 
@@ -91,12 +92,16 @@ int main(int argc, char **argv)
         emit(EV_ABS, ABS_MT_POSITION_Y, y);
         emit(EV_KEY, BTN_TOUCH, 1);
         syn();
-        /* hold ~90ms with no-move frames so the UI polls the press before the release */
-        for (int i = 0; i < 3; i++) {
-            usleep(30000);
+        /* Hold ~220ms with periodic no-move frames. The UI drains all pending evdev events each input
+         * poll and keeps the last state, so a too-short tap can be read as press+release in one poll and
+         * never register a click. A generous hold guarantees at least one poll sees a steady PRESSED
+         * before the release lands as a separate poll. */
+        usleep(80000);
+        for (int i = 0; i < 4; i++) {
             emit(EV_ABS, ABS_MT_POSITION_X, x);
             emit(EV_ABS, ABS_MT_POSITION_Y, y);
             syn();
+            usleep(35000);
         }
         emit(EV_ABS, ABS_MT_TRACKING_ID, -1);
         emit(EV_KEY, BTN_TOUCH, 0);

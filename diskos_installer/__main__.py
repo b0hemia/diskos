@@ -132,8 +132,7 @@ def cmd_install(args):
               "ui_binary": args.ui, "variant": args.variant}
     r = service.do_install(params, CLIReporter(), _cli_confirm(args.yes))
     if r.get("ok"):
-        ui.info("The UI is embedded in the flashed image - just reboot the device and it installs")
-        ui.info("diskOS automatically on first boot (no microSD step needed).")
+        ui.info("Reboot the device and diskOS installs itself automatically on first boot.")
         ui.info("To deactivate diskOS later (reflash your saved stock rootfs):  diskos-installer restore-stock")
         return 0
     return 3 if r.get("aborted") else 1

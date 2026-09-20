@@ -8,14 +8,13 @@ that keeps this project honest and the device un-bricked.
 
 ## How to use it
 
-- **Claude Code:** copy `agents/AGENTS.md` to `CLAUDE.md` at the repo root (or into
-  `~/.claude/`), or start a session and tell Claude to read `agents/AGENTS.md` first.
-- **Codex:** copy it to `AGENTS.md` at the repo root, or paste it in at the start of a session.
-- **Anything else:** paste the contents in as system/context before you start.
+- Copy `agents/AGENTS.md` to your agent's project-instruction file at the repo root (many agents
+  read an `AGENTS.md` there), or point your agent at it and have it read that file first.
+- Or paste the contents in as system/context before you start a session.
 
 The point is to give the agent the same guardrails we use: check `docs/HARDWARE.md` before
 claiming anything about the hardware, never assert device behavior from memory, keep the
-fail-closed boot contract intact, and treat a flash as recoverable-but-serious.
+fail-closed boot contract intact, and treat a flash as recoverable but serious - not guaranteed.
 
 ## Good first tasks
 

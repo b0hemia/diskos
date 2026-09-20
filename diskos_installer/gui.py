@@ -116,7 +116,7 @@ class App:
         self._build_config()
 
         # primary action
-        self.action_btn = ttk.Button(self.root, text="Install diskOS…",
+        self.action_btn = ttk.Button(self.root, text="Install diskOS...",
                                       style="Accent.TButton", command=self._on_action)
         self.action_btn.pack(fill="x", pady=(4, 8), **pad)
 
@@ -161,7 +161,7 @@ class App:
                 row=0, column=0, sticky="w")
             self.fw_var = tk.StringVar()
             ttk.Entry(inner, textvariable=self.fw_var, width=44).grid(row=1, column=0, sticky="we", pady=(2, 8))
-            ttk.Button(inner, text="Browse…", command=self._pick_firmware).grid(row=1, column=1, padx=(8, 0))
+            ttk.Button(inner, text="Browse...", command=self._pick_firmware).grid(row=1, column=1, padx=(8, 0))
             ttk.Label(inner, text="Variant:", style="Panel.TLabel").grid(row=2, column=0, sticky="w")
             self.variant = tk.StringVar(value="public")
             vr = ttk.Frame(inner, style="Panel.TFrame")
@@ -184,13 +184,13 @@ class App:
             if not have:
                 self.fw_var = tk.StringVar()
                 ttk.Entry(inner, textvariable=self.fw_var, width=44).grid(row=1, column=0, sticky="we", pady=(8, 0))
-                ttk.Button(inner, text="Browse…", command=self._pick_firmware).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
+                ttk.Button(inner, text="Browse...", command=self._pick_firmware).grid(row=1, column=1, padx=(8, 0), pady=(8, 0))
             inner.columnconfigure(0, weight=1)
         else:  # remove
             ttk.Label(inner, wraplength=460, style="Panel.TLabel",
                       text=("Deletes this installer's saved files from THIS computer. "
                             "Nothing was installed system-wide. If diskOS is still on the "
-                            "device, use ‘Remove diskOS’ first.")).pack(anchor="w")
+                            "device, use 'Remove diskOS' first.")).pack(anchor="w")
 
     # ---- helpers -----------------------------------------------------------
     def _pick_firmware(self):
@@ -219,8 +219,8 @@ class App:
 
     def _on_mode(self):
         self._build_config()
-        self.action_btn.config(text={"install": "Install diskOS…",
-                                     "restore": "Remove diskOS (restore stock)…",
+        self.action_btn.config(text={"install": "Install diskOS...",
+                                     "restore": "Remove diskOS (restore stock)...",
                                      "remove": "Uninstall this tool"}[self.mode.get()])
 
     def _log(self, line, color=None):
@@ -259,7 +259,7 @@ class App:
         self.bar.config(mode="determinate", value=0)
         self.status_lbl.config(text="")
         self.elapsed_lbl.config(text="")
-        self.phase_lbl.config(text="Starting…")
+        self.phase_lbl.config(text="Starting...")
         self._clear_finish_extra()
 
         def run():
@@ -339,7 +339,7 @@ class App:
         row = ttk.Frame(body)
         row.pack(side="bottom", fill="x", pady=(14, 0))
         ttk.Button(row, text="Cancel", command=lambda: _resolve(False)).pack(side="right", padx=(8, 0))
-        begin = ttk.Button(row, text=("Begin 60-90 minute flash" if destructive else "Proceed"),
+        begin = ttk.Button(row, text=("Begin flash (~15 min)" if destructive else "Proceed"),
                            style="Accent.TButton", command=lambda: _resolve(True))
         begin.pack(side="right")
 
@@ -446,47 +446,15 @@ class App:
         self._refresh_state_labels()
 
     def _install_followup(self):
-        """The UI is embedded in the flashed image, so first boot installs diskOS on its own -
-        no microSD step. Offer an OPTIONAL SD copy only as a recovery fallback."""
+        """Post-flash finish message. The UI is embedded in the flash and installs on first boot."""
         import tkinter as tk
-        from tkinter import ttk
         self._clear_finish_extra()
         box = tk.Frame(self.root, bg=OKC)
         box.pack(fill="x", padx=16, pady=(0, 8))
         self._finish_extra = box
         tk.Label(box, bg=OKC, fg="#111", font=self.f_h, justify="left", wraplength=500,
-                 text="Done - just power-cycle the device. diskOS is embedded in the flash and "
-                      "installs itself on first boot; no microSD step needed.").pack(
-            anchor="w", padx=10, pady=(8, 4))
-        tk.Label(box, bg=OKC, fg="#111", font=self.f_b, justify="left", wraplength=500,
-                 text="Optional: you can also stage a fallback copy on a microSD (used only if the "
-                      "embedded copy is ever unreadable).").pack(anchor="w", padx=10, pady=(0, 2))
-        ttk.Button(box, text="Copy fallback UI to microSD…", command=self._export_ui).pack(
-            anchor="w", padx=10, pady=(0, 8))
-
-    def _export_ui(self):
-        from tkinter import filedialog, messagebox
-        src = bundle.data("mq_ui", required=False)
-        if not src:
-            messagebox.showerror("diskOS Installer", "bundled mq_ui not found.")
-            return
-        d = filedialog.askdirectory(title="Select your microSD card (root)")
-        if not d:
-            return
-        try:
-            dest_dir = os.path.join(d, "diskos")
-            os.makedirs(dest_dir, exist_ok=True)
-            dest = os.path.join(dest_dir, "mq_ui")
-            with open(src, "rb") as s, open(dest, "wb") as o:
-                o.write(s.read())
-            os.chmod(dest, 0o755)
-            self._log(f"✓ copied UI to {dest}")
-            messagebox.showinfo("diskOS Installer",
-                                f"Copied a fallback diskOS UI to:\n{dest}\n\nThis is optional - the "
-                                "device installs the embedded copy on its own. The card is only used "
-                                "if that embedded copy is ever unreadable.")
-        except OSError as e:
-            messagebox.showerror("diskOS Installer", f"Could not copy to the card:\n{e}")
+                 text="Done - power-cycle the device and diskOS installs itself on first "
+                      "boot.").pack(anchor="w", padx=10, pady=(8, 8))
 
     def _fail(self, msg):
         self.flashing = False

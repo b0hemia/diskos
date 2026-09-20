@@ -86,8 +86,13 @@ static void skb_refresh(skb_t *c){
     }
 }
 static void skb_key_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    lv_event_code_t code = lv_event_get_code(e);
     skb_key_t *k=lv_event_get_user_data(e); skb_t *c=k->ctx;
+    if(code == LV_EVENT_LONG_PRESSED){
+        if(k->kind == SKB_BKSP) lv_textarea_set_text(c->ta, "");   /* hold backspace = clear the whole field */
+        return;
+    }
+    if(code != LV_EVENT_CLICKED) return;
     switch(k->kind){
     case SKB_CHAR: {
         char s[2]={ skb_char(c,k->row,k->col), 0 };
@@ -119,6 +124,7 @@ static void skb_add(skb_t *c, skb_kind_t kind, uint8_t row, uint8_t col,
     lv_obj_set_ext_click_area(k->btn,1);   /* easier taps; 1px keeps zero overlap inside the 3-4px row gaps */
     lv_obj_remove_flag(k->btn,LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(k->btn,skb_key_cb,LV_EVENT_CLICKED,k);
+    if(kind==SKB_BKSP) lv_obj_add_event_cb(k->btn,skb_key_cb,LV_EVENT_LONG_PRESSED,k);   /* hold to clear all */
     lv_obj_set_style_radius(k->btn,7,0);
     lv_obj_set_style_border_width(k->btn,1,0);
     lv_obj_set_style_border_color(k->btn,lv_color_hex(0x3A3A3C),0);
@@ -221,6 +227,8 @@ void kbinput_open(const char *title, const char *initial, kbinput_done_cb_t cb){
 
     g_ta = lv_textarea_create(g_modal);
     lv_textarea_set_one_line(g_ta, true);
+    lv_obj_set_scroll_dir(g_ta, LV_DIR_HOR);   /* one line: allow only the cursor-follow HORIZONTAL scroll - no vertical jitter */
+    lv_obj_set_scrollbar_mode(g_ta, LV_SCROLLBAR_MODE_OFF);
     if(title && title[0]) lv_textarea_set_placeholder_text(g_ta, title);
     if(initial && initial[0]) lv_textarea_set_text(g_ta, initial);
     if(g_mask_next){ lv_textarea_set_password_mode(g_ta, true); g_mask_next = 0; }  /* masked secret entry */
@@ -228,8 +236,16 @@ void kbinput_open(const char *title, const char *initial, kbinput_done_cb_t cb){
     lv_obj_align(g_ta, LV_ALIGN_TOP_MID, 0, 52);
     lv_obj_set_style_bg_color(g_ta, lv_color_hex(0x1C1C1E), 0);
     lv_obj_set_style_text_color(g_ta, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(g_ta, &lv_font_montserrat_16, 0);
+    /* typed text and the placeholder ("Password for <SSID>", a playlist name on Rename) are user
+     * data: route both parts through the chain so Cyrillic/CJK don't tofu (issue #3). */
+    lv_obj_set_style_text_font(g_ta, ui_font_cjk(16), 0);
+    lv_obj_set_style_text_font(g_ta, ui_font_cjk(16), LV_PART_TEXTAREA_PLACEHOLDER);
     lv_obj_set_style_border_width(g_ta, 0, 0);
+    /* Pin the internal label to a FIXED one-line height so the textarea's vertical centering can't drift
+     * as the measured text extent (ascenders/descenders/cursor) changes per keystroke -> no vertical bounce. */
+    lv_obj_set_style_pad_top(g_ta, 8, 0); lv_obj_set_style_pad_bottom(g_ta, 8, 0);   /* 40 - 24 line = 16 -> 8/8 centres one full line */
+    { lv_obj_t *ta_lbl = lv_textarea_get_label(g_ta);   /* pin to the FONT's 24px line height so the text can't clip and centring can't drift */
+      if(ta_lbl){ lv_obj_set_style_min_height(ta_lbl, 24, 0); lv_obj_set_style_max_height(ta_lbl, 24, 0); } }
 
     /* Cancel / Save in the wide mid-band, above the keyboard */
     pill(g_modal, -66, 108, LV_SYMBOL_CLOSE, lv_color_hex(0xC7C7CC), cancel_btn);

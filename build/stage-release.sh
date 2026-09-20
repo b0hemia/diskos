@@ -104,7 +104,7 @@ Needs Python 3.8+. The GUI additionally needs Tk (`apt install python3-tk`); dev
 
 ## Install / restore / remove
 See the bundled `README.md`. Requires putting the device in mask-ROM (power off, hold Vol-Down, plug
-USB). ~60-90 min; normally recoverable via mask-ROM, but not guaranteed.
+USB). ~15 min; normally recoverable via mask-ROM, but not guaranteed.
 
 ## Honest status
 Enthusiast flasher. Linux tested end-to-end on real hardware (V2.09 + V2.28). macOS build validation

@@ -17,7 +17,7 @@ import zipfile
 from . import bundle
 from .reporter import CLIReporter
 
-IMG_SIZE = 76021760          # diskOS image size: 580 NAND blocks (~72.5 MiB); written to the start of the mtd2 rootfs partition (RO squashfs need not fill the 128 MB partition)
+IMG_SIZE = 100663296         # diskOS image size: 768 NAND blocks (~96 MiB) - fits v2.40's 88 MB rootfs and covers v2.09/v2.28. The NAND writer (my_write5) MUST be built for this many blocks (NLOGBLOCKS=768); the flasher's writer-capacity check (dbg[6]) enforces it so a mismatched writer can't silently truncate. Written to the start of the mtd2 rootfs partition (128 MB); the RO squashfs need not fill it.
 
 # Known-good stock rootfs.squashfs, verified out-of-band (NOT trusting the in-zip OTA manifest,
 # which an attacker could modify consistently). A tested firmware whose extracted rootfs does not
@@ -27,10 +27,12 @@ IMG_SIZE = 76021760          # diskOS image size: 580 NAND blocks (~72.5 MiB); w
 PINNED_ROOTFS = {
     "228": ("0ffd877bca2c69ddff9ca70f4494da0d9e580c18d0f587e2c6d9921f2db82bd2", 72957952),
     "209": ("f1e3c69fb0e88b923c135558e01f4387a661f68839c8118e8ad490bdc9fc74e6", 75919360),
+    "240": ("b479e159db5134325819b5f6e5a54388f3adefae373a4ee60680f02d5dcf0bb8", 88420352),
 }
 # Firmware versions diskOS has been flash-tested against. Others have DIFFERENT command-tag
 # meanings, so diskOS built on them can send wrong commands and misbehave/reboot.
-TESTED_FW = {"209", "228"}
+# v2.40's 88 MB rootfs needs IMG_SIZE=96 MB + the 768-block writer (see IMG_SIZE note).
+TESTED_FW = {"209", "228", "240"}
 SQUASH_MAGIC = b"hsqs"
 
 
@@ -230,7 +232,7 @@ def extract_stock_rootfs(fw_zip, out_squashfs, workdir, rep=None):
     idxs = sorted(by_idx)
     if idxs != list(range(len(idxs))):
         raise BuildError(f"rootfs chunk indices are not a contiguous 0..{len(idxs)-1} sequence "
-                         f"(got {idxs[:3]}…{idxs[-1]}) - missing chunk, refusing.", code="E212")
+                         f"(got {idxs[:3]}...{idxs[-1]}) - missing chunk, refusing.", code="E212")
     chunks = [(i, by_idx[i]) for i in idxs]
 
     tmpout = os.path.join(workdir, "rootfs.assembled")

@@ -37,6 +37,7 @@
 #include "md5.h"
 #define JSMN_STATIC          /* file-local jsmn (ipc.c already exports the global copy) */
 #include "jsmn.h"
+#include "musicdb.h"   /* mdb_is_book_path: audiobooks are never scrobbled */
 
 #define LFM_ENDPOINT      "https://ws.audioscrobbler.com/2.0/"
 #define LFM_MAX_FORM      (32u * 1024u)
@@ -423,6 +424,7 @@ static char g_cur_path[520];   /* file path: part of track identity so consecuti
                                 * SAME title+artist each scrobble separately (not merged into one) */
 static long g_cur_dur_ms, g_cur_lastpos_ms, g_cur_listened_ms, g_cur_start_unix;
 static int  g_np_pending, g_scrobbled, g_have_cur;
+int ui_is_playing(void);   /* main.c: authoritative normalized play state (raw st->state is unreliable) */
 
 static int lfm_busy(void){ pthread_mutex_lock(&g_mu); int b=g_inflight||g_result_ready; pthread_mutex_unlock(&g_mu); return b; }
 
@@ -570,7 +572,7 @@ static void lfm_build_auth_url(void){
  * clean re-auth instead of silently reporting "connected" until the next request fails. */
 static void lfm_clear_session(void){
     g_sk[0]=0; g_user[0]=0; g_connected=0;
-    cfg_set_str(LFM_CFG_SK,""); cfg_set_str(LFM_CFG_USER,"");
+    cfg_begin(); cfg_set_str_deferred(LFM_CFG_SK,""); cfg_set_str_deferred(LFM_CFG_USER,""); cfg_commit();   /* atomic */
 }
 static void lfm_handle_result(const lfm_result_t *r){
     if((r->kind==JOB_GET_TOKEN||r->kind==JOB_GET_SESSION) && r->gen!=g_gen) return;  /* stale auth */
@@ -587,7 +589,7 @@ static void lfm_handle_result(const lfm_result_t *r){
             if(strlen(r->api.session_key) < sizeof g_sk){
                 snprintf(g_sk,sizeof g_sk,"%s",r->api.session_key);
                 snprintf(g_user,sizeof g_user,"%s",r->api.username);
-                cfg_set_str(LFM_CFG_SK,g_sk); cfg_set_str(LFM_CFG_USER,g_user);
+                cfg_begin(); cfg_set_str_deferred(LFM_CFG_SK,g_sk); cfg_set_str_deferred(LFM_CFG_USER,g_user); cfg_commit();   /* atomic */
                 g_connected=1; g_auth_state=LFM_AUTH_OK;
             } else g_auth_state=LFM_AUTH_ERR;      /* absurd key length -> refuse */
         } else if(r->ok && r->api.api_error==14){  /* pending user authorization: keep polling */
@@ -632,7 +634,8 @@ static void lfm_drive_auth(void){
 static void lfm_drive_jobs(void){
     if(!g_enabled||!g_connected) return;
     if(lfm_now_ms()<g_backoff_ms || lfm_busy()) return;
-    if(g_np_pending && g_have_cur){
+    if(g_np_pending && g_have_cur && ui_is_playing()){   /* a candidate started while playing but dispatch was delayed
+                                                          * (backoff/busy) then paused -> do not send Now Playing while paused */
         lfm_job_t *j=lfm_new_job(JOB_NOWPLAYING); if(!j) return;
         snprintf(j->artist,sizeof j->artist,"%s",g_cur_artist);
         snprintf(j->track ,sizeof j->track ,"%s",g_cur_track);
@@ -724,6 +727,9 @@ static const char LFM_PAGE_A[] =
     "button{width:100%;padding:.8em;font-size:1em;border:0;border-radius:8px;background:#d51007;color:#fff;font-weight:600}"
     "a{color:#d51007}ol{padding-left:1.2em}li{margin:.4em 0}</style>"
     "<h2>Connect this player to Last.fm</h2>"
+    "<p style='background:#2a1a1a;border:1px solid #d51007;border-radius:8px;padding:.6em .8em;font-size:.85em;color:#f2c2c2'>"
+    "This page is served over your local Wi-Fi <b>without encryption</b>. Only enter your keys on a network you trust, "
+    "and remove the app's credentials from your Last.fm account if you stop using this player.</p>"
     "<ol><li>Open <a href='https://www.last.fm/api/account/create' target=_blank>last.fm/api/account/create</a> and sign in.</li>"
     "<li>Fill in any <b>Application name</b> (e.g. diskOS) and description; leave callback/homepage blank. Submit.</li>"
     "<li>Copy your <b>API key</b> and <b>Shared secret</b> and paste them below.</li></ol>"
@@ -888,10 +894,20 @@ static void lfm_start_candidate(const track_state_t *st){
 }
 void lastfm_watch(const track_state_t *st){
     if(!g_inited || !g_enabled || !g_connected || !st) return;
-    int playing = st->have_track && st->title[0] && st->artist[0];
-    if(!playing){                       /* stopped/idle: finalize + forget so a later replay counts as new */
+    /* st->state is raw A2 metadata, UNRELIABLE for play-state (reports 0 while playing -- see ipc.h),
+     * so use the main loop's authoritative g_playing. A track with no real playback (boot-seeded pause,
+     * a paused seek) must never advertise Now Playing. */
+    /* Audiobooks are not music: never advertise Now Playing or scrobble them. Treated as "no track" so
+     * the outgoing music candidate still finalizes and a book never becomes a candidate. */
+    int have = st->have_track && st->title[0] && st->artist[0] && !mdb_is_book_path(st->path);
+    if(!have){                          /* truly stopped / no track / a book: finalize + forget so a replay counts as new */
         lfm_finalize_candidate();
         g_have_cur=0; g_cur_track[0]=0; g_cur_artist[0]=0;
+        return;
+    }
+    if(!ui_is_playing()){               /* track loaded but PAUSED: hold the current candidate (don't reset it,
+                                         * don't start one, don't send Now Playing) until playback resumes. */
+        if(g_have_cur) g_cur_lastpos_ms = st->position_ms;   /* absorb paused seeks so the jump isn't counted as listening on resume */
         return;
     }
     if(!g_have_cur || strcmp(st->path,g_cur_path) || strcmp(st->title,g_cur_track) || strcmp(st->artist,g_cur_artist)){
@@ -924,15 +940,18 @@ void lastfm_set_credentials(const char *api_key,const char *secret){
     if(!api_key||!secret) return;
     snprintf(g_api_key,sizeof g_api_key,"%s",api_key);
     snprintf(g_secret ,sizeof g_secret ,"%s",secret);
-    cfg_set_str(LFM_CFG_API,g_api_key); cfg_set_str(LFM_CFG_SEC,g_secret);
+    /* one atomic write for all four credential keys: a mid-run save failure can no longer leave
+     * api/secret persisted without clearing the stale session (or the reverse). */
+    cfg_begin();
+    cfg_set_str_deferred(LFM_CFG_API,g_api_key); cfg_set_str_deferred(LFM_CFG_SEC,g_secret);
     g_have_creds = g_api_key[0] && g_secret[0];
     g_sk[0]=0; g_user[0]=0; g_connected=0;                 /* new app -> re-auth */
-    cfg_set_str(LFM_CFG_SK,""); cfg_set_str(LFM_CFG_USER,"");
+    cfg_set_str_deferred(LFM_CFG_SK,""); cfg_set_str_deferred(LFM_CFG_USER,""); cfg_commit();
     g_gen++; g_auth_state=LFM_AUTH_IDLE;
 }
 void lastfm_logout(void){
     g_sk[0]=0; g_user[0]=0; g_connected=0;
-    cfg_set_str(LFM_CFG_SK,""); cfg_set_str(LFM_CFG_USER,"");
+    cfg_begin(); cfg_set_str_deferred(LFM_CFG_SK,""); cfg_set_str_deferred(LFM_CFG_USER,""); cfg_commit();   /* atomic */
     g_gen++; g_auth_state=LFM_AUTH_IDLE;
 }
 void lastfm_auth_begin(void){

@@ -58,7 +58,7 @@ static lv_obj_t *menu_row(lv_obj_t *list, const char *text, lv_event_cb_t cb, vo
     lv_obj_t *l = lv_label_create(r);
     lv_label_set_text(l, text);
     lv_obj_set_pos(l, 16, 16);
-    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(l, ui_font_cjk(16), 0);   /* rows carry playlist names: chain (issue #3) */
     lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), 0);
     return r;
 }
@@ -73,6 +73,7 @@ static lv_obj_t *panel_list(lv_obj_t *root){
     lv_obj_t *list = lv_obj_create(root);
     lv_obj_remove_style_all(list);
     lv_obj_set_pos(list, 46, 76); lv_obj_set_size(list, 280, 250);
+    lv_obj_set_style_pad_bottom(list, 44, 0);   /* last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_row(list, 10, 0);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
@@ -172,6 +173,7 @@ static lv_obj_t *dlg_btn(lv_obj_t *p, int y, const char *txt, lv_color_t bg, lv_
     lv_obj_t *b = lv_button_create(p);
     lv_obj_remove_style_all(b);
     lv_obj_set_size(b, 200, 38);
+    lv_obj_set_ext_click_area(b, 4);   /* 38px pill -> ~46px touch target */
     lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
     lv_obj_set_style_radius(b, 12, 0);
     lv_obj_set_style_bg_color(b, bg, 0);
@@ -272,16 +274,38 @@ static void hub_fsart_cb(lv_event_t *e){
     lv_timer_t *t = lv_timer_create(fsart_deferred_cb, 360, NULL);
     lv_timer_set_repeat_count(t, 1);
 }
+static void hub_chapters_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) chapters_open(); }
+
+static lv_obj_t *g_hub_list;
+/* (Re)populate the hub for the current track. Books get Chapters and drop the music-only entries
+ * (Lyrics / Go to Album / Go to Artist / Add to Playlist) that make no sense for a single audiobook. */
+static void nphub_populate(void){
+    if(!g_hub_list) return;
+    lv_obj_clean(g_hub_list);
+    track_state_t st; ipc_get_state(&st);
+    int book = st.path[0] && mdb_is_book_path(st.path);
+    if(book){
+        /* navigate, understand the book, then the rest - the order the listener reaches for most first */
+        menu_row(g_hub_list, "Chapters",        hub_chapters_cb, NULL);
+        menu_row(g_hub_list, "Book details",    ctx_info_cb,     NULL);   /* Song Info screen, relabelled for books */
+        menu_row(g_hub_list, "Equalizer",       hub_eq_cb,       NULL);
+        menu_row(g_hub_list, "Full-screen Art", hub_fsart_cb,    NULL);
+    } else {
+        menu_row(g_hub_list, "Full-screen Art", hub_fsart_cb,  NULL);
+        menu_row(g_hub_list, "Equalizer",       hub_eq_cb,     NULL);
+        menu_row(g_hub_list, "Song Info",       ctx_info_cb,   NULL);
+        menu_row(g_hub_list, "Lyrics",          ctx_lyrics_cb, NULL);
+        menu_row(g_hub_list, "Go to Album",     ctx_album_cb,  NULL);
+        menu_row(g_hub_list, "Go to Artist",    ctx_artist_cb, NULL);
+        menu_row(g_hub_list, "Add to Playlist", ctx_addpl_cb,  NULL);
+    }
+}
+void nphub_refresh(void){ nphub_populate(); }   /* called on each SCR_NPHUB show (screenmgr) */
+
 void nphub_create(lv_obj_t *root){
     panel_header(root, "Options");
-    lv_obj_t *list = panel_list(root);
-    menu_row(list, "Full-screen Art", hub_fsart_cb,  NULL);
-    menu_row(list, "Equalizer",       hub_eq_cb,     NULL);
-    menu_row(list, "Song Info",       ctx_info_cb,   NULL);
-    menu_row(list, "Lyrics",          ctx_lyrics_cb, NULL);
-    menu_row(list, "Go to Album",     ctx_album_cb,  NULL);
-    menu_row(list, "Go to Artist",    ctx_artist_cb, NULL);
-    menu_row(list, "Add to Playlist", ctx_addpl_cb,  NULL);
+    g_hub_list = panel_list(root);
+    nphub_populate();
     /* page dots - the hub is the right page (Now Playing is the left) */
     for(int i=0;i<2;i++){
         lv_obj_t *dot = lv_obj_create(root);
@@ -296,7 +320,8 @@ void nphub_create(lv_obj_t *root){
 
 /* ---- tuning menu (SCR_TUNE): Play Mode + Equalizer cyclers --------------- */
 static const char *const T_MODE[] = { "Sequential","Shuffle","Repeat One","Repeat All","Single" };
-static const char *const T_EQ[]   = { "Off","Jazz","Rock","R&B","Hip-Hop","Pop","Dance","Classical","Retro","Sibilance 1","Sibilance 2","Custom" };
+static const char *const T_EQ[]   = { "Off","Jazz","Rock","R&B","Hip-Hop","Pop","Dance","Classical","Retro","Sibilance 1","Sibilance 2",
+                                      "USER1","USER2","USER3","USER4","USER5","USER6","USER7","USER8","USER9","USER10" };  /* 11..20 = user PEQ slots */
 
 static lv_obj_t *g_mode_val, *g_eq_val;
 static int g_tune_built = 0;
@@ -307,21 +332,22 @@ static int g_tune_built = 0;
 void tune_refresh(void){
     if(!g_tune_built) return;
     int m = cfg_get_int("work_mode", 0); if(m<0||m>4) m=0;
-    int q = cfg_get_int("eq_preset", 0); if(q<0||q>11) q=0;
+    int q = cfg_get_int("eq_preset", 0); if(q<0||q>20) q=0;
     if(g_mode_val) lv_label_set_text(g_mode_val, T_MODE[m]);
     if(g_eq_val)   lv_label_set_text(g_eq_val,   T_EQ[q]);
 }
 
 static void cyc_apply(const char *key, const char *const *opts, int n, void *valobj, int dir){
-    int v = cfg_get_int(key, 0) + dir;
-    if(v<0) v=n-1; if(v>=n) v=0;
-    cfg_set_int(key, v);
-    if(!strcmp(key,"work_mode")) ui_set_workmode(v);
-    else if(!strcmp(key,"eq_preset")) ui_apply_eq(v);
+    int base = cfg_get_int(key, 0); if(base < 0 || base >= n) base = 0;   /* normalize a corrupt stored value BEFORE stepping (no signed overflow, no OOB) */
+    int v = base + dir;
+    if(v<0) v=n-1; else if(v>=n) v=0;
+    if(strcmp(key,"eq_preset")) cfg_set_int(key, v);   /* EQ persists on a successful send via ui_eq_select */
+    if(!strcmp(key,"work_mode")){ if(!ui_book_active()) ui_set_workmode(v); }   /* an active book stays in Single; cfg still updates so music later uses the chosen mode */
+    else if(!strcmp(key,"eq_preset")){ if(ui_eq_select(v) < 0){ v = cfg_get_int("eq_preset", 0); if(v<0||v>=n) v=0; } }   /* failed send -> label keeps the real preset (clamped: a corrupt stored value must not index opts[] OOB) */
     if(valobj) lv_label_set_text((lv_obj_t*)valobj, opts[v]);
 }
 static void mode_dir_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) cyc_apply("work_mode", T_MODE, 5, g_mode_val, (int)(intptr_t)lv_event_get_user_data(e)); }
-static void eq_dir_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) cyc_apply("eq_preset", T_EQ, 12, g_eq_val, (int)(intptr_t)lv_event_get_user_data(e)); }
+static void eq_dir_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) cyc_apply("eq_preset", T_EQ, 21, g_eq_val, (int)(intptr_t)lv_event_get_user_data(e)); }
 static void eq_custom_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_show(SCR_EQ); }
 
 /* a "< label : value >" stepper row */
@@ -361,7 +387,7 @@ static lv_obj_t *cyc_row(lv_obj_t *parent, int y, const char *label,
 void tune_create(lv_obj_t *root){
     panel_header(root, "Playback");
     int m = cfg_get_int("work_mode", 0); if(m<0||m>4) m=0;
-    int q = cfg_get_int("eq_preset", 0); if(q<0||q>11) q=0;
+    int q = cfg_get_int("eq_preset", 0); if(q<0||q>20) q=0;
     cyc_row(root, 84,  "PLAY MODE",  mode_dir_cb, &g_mode_val, T_MODE[m]);
     cyc_row(root, 158, "EQUALIZER",  eq_dir_cb,   &g_eq_val,   T_EQ[q]);
     g_tune_built = 1;

@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
 #include "screens.h"
+#include "folderbrowser.h"
+#include "books.h"
 #include "anim.h"
 #include "config.h"
 #include <unistd.h>
@@ -12,7 +14,7 @@ static lv_obj_t *s_scrim;        /* depth overlay dimming the screen beneath the
 static int s_current = SCR_HOME;
 static int s_stack[16];
 static int s_sp = 0;
-#define PUSH_MS 320   /* entrance (expo-out: covers distance fast, settles gently) */
+#define PUSH_MS 300   /* entrance (cubic ease-out: covers distance fast, settles gently) */
 #define POP_MS  240   /* exit faster than entrance - a premium-motion reflex */
 static int s_anim = 1;   /* slide transitions; disabled by /usr/data/anim_off */
 
@@ -103,12 +105,20 @@ static void transition(int from, int to, int dir)
     /* Any screen change dismisses transient lv_layer_top popups (e.g. the duplicate-add
      * confirm dialog) so they can't survive onto another screen and act on stale state. */
     npmenu_close_transients();
+    ui_np_close_overlays();   /* dismiss the sleep-timer popover so it can't float onto another screen */
 
     /* Re-sync screens built once, on EVERY entry incl. back-navigation (screen_back also
      * routes through here - screen_show alone missed the back case, leaving stale labels
      * e.g. after editing Custom EQ / a setting detail page). */
     if (to == SCR_SETTINGS) settings_refresh_list();
+    else if (to == SCR_SETLIST) setlist_refresh();          /* one category's rows, rebuilt per entry */
+    else if (to == SCR_SETTING_DETAIL) setting_detail_refresh();  /* stay live if changed elsewhere (e.g. drawer EQ) */
+    else if (to == SCR_QSCONFIG) qsconfig_refresh();        /* tile picker, rebuilt per entry */
+    else if (to == SCR_QUICK) quicksettings_build();        /* drawer rebuilt from config on every open */
+    else if (to == SCR_EQ) eqcustom_refresh();              /* re-resolve edited USER slot */
+    else if (to == SCR_ALBUMWALL) albumwall_refresh();      /* cover-flow album browser */
     else if (to == SCR_TUNE)  tune_refresh();
+    else if (to == SCR_NPHUB) nphub_refresh();   /* book-aware hub (Chapters for audiobooks) */
     else if (to == SCR_SAVER) saver_show_sync();
     else if (to == SCR_PLVIEW) plview_refresh();   /* fresh song list every entry (no stale tap positions) */
     else if (to == SCR_LIBRARY) library_refresh(); /* pick up playlists created (NP New Playlist) or imported
@@ -257,6 +267,12 @@ void screens_init(void)
     s_roots[SCR_LASTFM] = screen_make_root(parent);
     s_roots[SCR_WORKMODE] = screen_make_root(parent);
     s_roots[SCR_DEBUG] = screen_make_root(parent);
+    s_roots[SCR_FOLDER] = screen_make_root(parent);
+    s_roots[SCR_BOOKS] = screen_make_root(parent);
+    s_roots[SCR_CHAPTERS] = screen_make_root(parent);
+    s_roots[SCR_SETLIST] = screen_make_root(parent);
+    s_roots[SCR_QSCONFIG] = screen_make_root(parent);
+    s_roots[SCR_ALBUMWALL] = screen_make_root(parent);
 
     /* depth scrim: a full-screen translucent-black overlay, created LAST so it sits above the
      * roots in sibling order; re-parented in z during a transition to dim the screen beneath the
@@ -278,6 +294,9 @@ void screens_init(void)
     ui_create(s_roots[SCR_NOWPLAYING]);
     settings_create(s_roots[SCR_SETTINGS]);
     setting_detail_create(s_roots[SCR_SETTING_DETAIL]);
+    setlist_create(s_roots[SCR_SETLIST]);
+    qsconfig_create(s_roots[SCR_QSCONFIG]);
+    albumwall_create(s_roots[SCR_ALBUMWALL]);
     search_create(s_roots[SCR_SEARCH]);
     saver_create(s_roots[SCR_SAVER]);
     quicksettings_create(s_roots[SCR_QUICK]);
@@ -288,6 +307,9 @@ void screens_init(void)
     colorpick_create(s_roots[SCR_COLORPICK]);
     modes_create(s_roots[SCR_WORKMODE]);
     debug_create(s_roots[SCR_DEBUG]);
+    folderbrowser_create(s_roots[SCR_FOLDER]);
+    books_create(s_roots[SCR_BOOKS]);
+    chapters_create(s_roots[SCR_CHAPTERS]);
     apps_create(s_roots[SCR_APPS]);
     nphub_create(s_roots[SCR_NPHUB]);
     plpick_create(s_roots[SCR_PLPICK]);

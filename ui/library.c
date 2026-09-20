@@ -1,7 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
 #include "screens.h"
+#include "folderbrowser.h"
+#include "books.h"
 #include "musicdb.h"
+#include "artcache.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,6 +13,8 @@
 #include "config.h"
 
 enum { VIEW_MENU, VIEW_SONGS, VIEW_ALBUMS, VIEW_ARTISTS, VIEW_PLAYLISTS, VIEW_FAVS, VIEW_GENRES, VIEW_GROUP, VIEW_MOSTPLAYED, VIEW_RECENT, VIEW_HISTORY, VIEW_COUNT };
+#define CAT_FOLDERS 1000   /* menu sentinel: opens the folder browser (a screen, not a library view) */
+#define CAT_BOOKS   1001   /* menu sentinel: opens the Books (audiobook) screen */
 
 #define ROW_H 52
 #define LIST_Y 70
@@ -26,6 +31,7 @@ static int g_view = VIEW_MENU;
 static int g_drill_kind = 0;  /* 1 album, 2 artist */
 static int g_deeplink = 0;    /* drill opened from the NP hub -> back leaves the Library */
 static int g_has_header = 0;   /* a Play All / Shuffle row is the first list child */
+static int g_hdr_extra_px = 0; /* extra leading height above the rows (the album cover header), for scroll math */
 static char g_drill[MDB_STR];
 static library_song_click_cb_t g_song_cb;
 
@@ -42,6 +48,7 @@ static int  g_count;
 static char (*g_gnames)[MDB_STR]  = NULL;
 static char (*g_gartists)[MDB_STR] = NULL;
 static int  *g_gcounts = NULL;
+static void lib_ensure_group_cap(int need);   /* grow group buffers to an exact count (artist view) */
 static mdb_song_t *g_favs = NULL;
 static char (*g_plnames)[MDB_STR] = NULL;   /* dynamic: grown to the real playlist count (no 64 cap) */
 static long *g_plids = NULL;
@@ -169,7 +176,7 @@ static void fav_confirm(int id){
     lv_label_set_long_mode(s, LV_LABEL_LONG_DOT);
     lv_obj_set_width(s, 224);
     lv_obj_set_style_text_align(s, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_font(s, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(s, ui_font_cjk(14), 0);   /* song title is user data: Cyrillic/CJK-capable (issue #3) */
     lv_obj_set_style_text_color(s, lv_color_hex(0x8E8E93), 0);
     lv_obj_align(s, LV_ALIGN_TOP_MID, 0, 52);
     fav_modal_pill(card, -58, "Cancel", 0xC7C7CC, fav_cancel_cb);
@@ -222,7 +229,11 @@ static void group_play_cb(lv_event_t *e){
 }
 static void menu_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
-    g_view=(int)(uintptr_t)lv_event_get_user_data(e);
+    int v=(int)(uintptr_t)lv_event_get_user_data(e);
+    if(v==CAT_FOLDERS){ folderbrowser_open(); return; }   /* opens a screen, not a library view */
+    if(v==CAT_BOOKS){ books_open(); return; }             /* audiobooks: a screen, not a library view */
+    if(v==VIEW_ALBUMS && cfg_get_int("album_view", 0)==1){ screen_show(SCR_ALBUMWALL); return; }  /* cover flow */
+    g_view=v;
     g_drill_kind=0; library_reload();
 }
 /* Step one level back WITHIN the library (drill-in -> its category list -> the
@@ -405,14 +416,77 @@ static void hdr_btn(lv_obj_t *row, int x, const char *txt, lv_event_cb_t cb){
     lv_obj_set_style_text_color(l, lv_color_hex(0xFFFFFF), 0);
     lv_obj_center(l);
 }
-/* the first row of a song list: [ Play All ] [ Shuffle ] */
-static void add_play_header(void){
+/* Album detail header: the album cover on top (from the art cache) with the artist beneath it, shown
+ * above the Play All / Shuffle row for an album drill - from EITHER the list view or the cover flow. */
+static int g_hdr_cover_ctr;
+static void add_album_cover_header(const char *album, const char *artist){
     lv_obj_t *r = lv_obj_create(g_list);
     lv_obj_remove_style_all(r);
-    lv_obj_set_size(r, 268, ROW_H);
+    int has_artist = artist && artist[0];
+    int hdr_h = has_artist ? 196 : 172;
+    lv_obj_set_size(r, 286, hdr_h);   /* full list width so the cover screen-centres */
+    g_hdr_extra_px = hdr_h + 4;        /* +flex pad_row: the A-Z scroll math subtracts this leading height */
     lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-    hdr_btn(r, 0,   LV_SYMBOL_PLAY    "  Play All", play_all_cb);
-    hdr_btn(r, 140, LV_SYMBOL_SHUFFLE "  Shuffle",  shuffle_all_cb);
+    const int CX = 7;   /* the list sits at x30/w286 (centre 173); +7 puts TOP_MID content at screen-centre 180 */
+
+    /* Resolve the album's cached 148px cover (first track that has one) into a ROTATING /tmp file so
+     * LVGL's image cache can't serve a previous album's bitmap for a reused filename. */
+    char src[64]; src[0] = 0;
+    int ids[6]; int n = mdb_album_track_ids(album, ids, 6);
+    for(int i=0;i<n;i++){
+        char track[512]; track[0]=0;
+        char tmp[48]; snprintf(tmp, sizeof tmp, "/tmp/album_hdr%d.bmp", g_hdr_cover_ctr & 3);
+        if(mdb_song_path(ids[i], track, sizeof track) && track[0] && artcache_get_cover(track, tmp)==0){
+            snprintf(src, sizeof src, "A:%s", tmp); g_hdr_cover_ctr++;
+            break;
+        }
+    }
+    if(src[0]){
+        lv_obj_t *img = lv_image_create(r);
+        lv_image_set_src(img, src);                         /* native 148x148 BMP (no scale/rotate: SW renderer) */
+        lv_obj_align(img, LV_ALIGN_TOP_MID, CX, 10);
+    } else {                                                /* art-less album -> dark tile with its initial */
+        lv_obj_t *ph = lv_obj_create(r);
+        lv_obj_remove_style_all(ph);
+        lv_obj_set_size(ph, 148, 148); lv_obj_align(ph, LV_ALIGN_TOP_MID, CX, 10);
+        lv_obj_set_style_bg_color(ph, lv_color_hex(0x2C2C2E), 0);
+        lv_obj_set_style_bg_opa(ph, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(ph, 12, 0);
+        lv_obj_t *in = lv_label_create(ph);
+        char init[8]={0};   /* one WHOLE UTF-8 code point (a bare first byte tofus Cyrillic/CJK) */
+        if(album && album[0]){ unsigned char c0=(unsigned char)album[0];
+            int len=(c0<0x80)?1:((c0>>5)==0x6)?2:((c0>>4)==0xE)?3:((c0>>3)==0x1E)?4:1;
+            for(int i=0;i<len && album[i];i++) init[i]=album[i];
+            if(len==1 && init[0]>='a'&&init[0]<='z') init[0]-=32;
+        } else init[0]='?';
+        lv_label_set_text(in, init);
+        /* ui_text_font tops out at 20 (would silently shrink a 28 request to 16): use the big latin face
+         * for an ASCII initial, else the largest CJK-capable size so a non-Latin initial still renders. */
+        lv_obj_set_style_text_font(in, (unsigned char)init[0] < 0x80 ? &lv_font_montserrat_28 : ui_font_cjk(20), 0);
+        lv_obj_set_style_text_color(in, lv_color_hex(0x8E8E93), 0);
+        lv_obj_center(in);
+    }
+    if(has_artist){
+        lv_obj_t *a = lv_label_create(r);
+        lv_label_set_long_mode(a, LV_LABEL_LONG_DOT); lv_obj_set_width(a, 240);
+        lv_obj_set_style_text_align(a, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_text(a, artist);
+        lv_obj_set_style_text_font(a, ui_text_font(15), 0);
+        lv_obj_set_style_text_color(a, lv_color_hex(0x8E8E93), 0);
+        lv_obj_align(a, LV_ALIGN_TOP_MID, CX, 166);
+    }
+}
+
+/* the first row of a song list: [ Play All ] [ Shuffle ]. centered=1 screen-centres the pair (used under
+ * the album cover card, so it lines up with the centred cover instead of the left-aligned list rows). */
+static void add_play_header(int centered){
+    lv_obj_t *r = lv_obj_create(g_list);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_size(r, centered ? 286 : 268, ROW_H);
+    lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    int base = centered ? 16 : 0;                 /* r-local 16 => screen-centre (list is at x30/w286) */
+    hdr_btn(r, base,       LV_SYMBOL_PLAY    "  Play All", play_all_cb);
+    hdr_btn(r, base + 140, LV_SYMBOL_SHUFFLE "  Shuffle",  shuffle_all_cb);
     g_has_header = 1;
 }
 
@@ -427,6 +501,7 @@ static void library_reload(void){
     lv_obj_clean(g_list);
     g_count = 0;
     g_has_header = 0;
+    g_hdr_extra_px = 0;
     lv_obj_scroll_to_y(g_list, 0, LV_ANIM_OFF);
 
     const char *ttl = (g_view==VIEW_GROUP) ? g_drill : VIEW_TITLE[g_view];
@@ -445,9 +520,10 @@ static void library_reload(void){
 
     if(g_view==VIEW_MENU){
         /* "Most Played" + "Recently Played" are play STATS, not catalog axes -> grouped under History */
-        static const char *CATS[] = { "Songs","Albums","Artists","Genres","Playlists","Favourites","History" };
-        static const int   CATV[] = { VIEW_SONGS,VIEW_ALBUMS,VIEW_ARTISTS,VIEW_GENRES,VIEW_PLAYLISTS,VIEW_FAVS,VIEW_HISTORY };
-        for(int i=0;i<7;i++){
+        static const char *CATS[] = { "Songs","Albums","Artists","Genres","Playlists","Favourites","Folders","Books","History" };
+        static const int   CATV[] = { VIEW_SONGS,VIEW_ALBUMS,VIEW_ARTISTS,VIEW_GENRES,VIEW_PLAYLISTS,VIEW_FAVS,CAT_FOLDERS,CAT_BOOKS,VIEW_HISTORY };
+        for(int i=0;i<(int)(sizeof CATS/sizeof CATS[0]);i++){
+            if(!DISKOS_AUDIOBOOKS && CATV[i]==CAT_BOOKS) continue;   /* compile-time gate (DISKOS_AUDIOBOOKS, currently 1): hides the Books row when the audiobook feature is built out */
             lv_obj_t *r = base_row();
             lv_obj_add_event_cb(r, menu_cb, LV_EVENT_CLICKED, (void*)(uintptr_t)CATV[i]);
             row_two(r, CATS[i], NULL, NULL);
@@ -479,7 +555,9 @@ static void library_reload(void){
         if(g_view==VIEW_GROUP) n=(g_drill_kind==1)?mdb_album_songs(g_drill,g_buf,g_alloc_n):(g_drill_kind==3)?mdb_genre_songs(g_drill,g_buf,g_alloc_n):mdb_artist_songs(g_drill,g_buf,g_alloc_n);
         else { n=mdb_song_count(); if(n>g_alloc_n) n=g_alloc_n; for(int i=0;i<n;i++) g_buf[i]=mdb_song(i); }
         if(n<=0){ empty_scan("No songs found"); return; }
-        add_play_header();
+        int is_album = (g_view==VIEW_GROUP && g_drill_kind==1);
+        if(is_album) add_album_cover_header(g_drill, n>0 ? g_buf[0]->artist : NULL);  /* album drill: cover on top */
+        add_play_header(is_album);                                       /* centre the pair under the album cover */
         for(int i=0;i<n;i++) g_first[i]=first_letter(g_buf[i]->title);
         g_count=n; fill_start(n);
         if(g_view==VIEW_SONGS) az_show(1);
@@ -489,6 +567,7 @@ static void library_reload(void){
         for(int i=0;i<n;i++) g_first[i]=first_letter(g_gnames[i]);
         g_count=n; fill_start(n); az_show(1);
     } else if(g_view==VIEW_ARTISTS){
+        lib_ensure_group_cap(mdb_artist_count());   /* size for every distinct artist so none are clipped */
         int n=mdb_artists(g_gnames,g_grp_cap);
         if(n<=0){ empty_scan("No artists found"); return; }
         for(int i=0;i<n;i++) g_first[i]=first_letter(g_gnames[i]);
@@ -501,7 +580,7 @@ static void library_reload(void){
     } else if(g_view==VIEW_FAVS){
         int n=mdb_favorites(g_favs, g_alloc_n);
         if(n<=0){ empty_label("No Favourites yet"); return; }
-        add_play_header();
+        add_play_header(0);
         for(int i=0;i<n;i++) g_first[i]=first_letter(g_favs[i].title);
         g_count=n; fill_start(n); az_show(1);
     } else if(g_view==VIEW_MOSTPLAYED || g_view==VIEW_RECENT){
@@ -571,9 +650,13 @@ static void lhint_timer_cb(lv_timer_t *t){ (void)t;
 /* called from the rim-scroll handler while the Library list is the one scrolling */
 void library_scroll_letter_tick(void){
     if(!g_list || !g_lhint || g_count <= 0) return;
-    if(g_view==VIEW_MENU || g_view==VIEW_PLAYLISTS) return;   /* not an alphabetical list */
+    /* Only the views that actually fill g_first[] (alphabetical lists) get the A-Z scrubber hint.
+     * MostPlayed/Recent/History (and Menu/Playlists) never populate g_first, so reading it there
+     * showed stale letters from a prior view. Allowlist, so any new view defaults to no hint. */
+    if(!(g_view==VIEW_SONGS || g_view==VIEW_GROUP || g_view==VIEW_ALBUMS ||
+         g_view==VIEW_ARTISTS || g_view==VIEW_GENRES || g_view==VIEW_FAVS)) return;
     int pitch = ROW_H + 4;
-    int idx = lv_obj_get_scroll_y(g_list)/pitch - g_has_header;
+    int idx = (lv_obj_get_scroll_y(g_list) - g_hdr_extra_px)/pitch - g_has_header;
     if(idx < 0) idx = 0; else if(idx >= g_count) idx = g_count - 1;
     char ch = g_first[idx];
     if(ch && ch != g_lhint_ch){ g_lhint_ch = ch; char b[2]={ch,0}; lv_label_set_text(g_lhint_lbl, b); }
@@ -604,7 +687,21 @@ static void lib_alloc_buffers(int songs){
 /* Grow the buffers if the library outgrew them - e.g. a clean first boot allocated for 1 song
  * and a rescan then added thousands. Call after any mdb_load() that may have added tracks. */
 void library_ensure_capacity(void){
-    if(mdb_song_count() > g_alloc_n) lib_alloc_buffers(mdb_song_count());
+    int total = mdb_total_song_count();   /* full catalog: unfiltered Favourites/history also fill these buffers */
+    if(total > g_alloc_n) lib_alloc_buffers(total);
+}
+
+/* Grow ONLY the group buffers (artist/album/genre rows + A-Z first-letters) to hold `need` entries.
+ * The default headroom (2*songs+64) is ample, but tokenized artists have no song-bounded ceiling,
+ * so the artist view sizes to the exact distinct count first - no silent clipping. A realloc miss
+ * leaves the current (smaller) capacity, which callers still respect via g_grp_cap. */
+static void lib_ensure_group_cap(int need){
+    if(need <= g_grp_cap) return;
+    char (*a)[MDB_STR] = realloc(g_gnames,   (size_t)need * sizeof *g_gnames);   if(!a) return; g_gnames   = a;
+    char (*b)[MDB_STR] = realloc(g_gartists, (size_t)need * sizeof *g_gartists); if(!b) return; g_gartists = b;
+    int   *c           = realloc(g_gcounts,  (size_t)need * sizeof *g_gcounts);  if(!c) return; g_gcounts  = c;
+    char  *f           = realloc(g_first,    (size_t)need);                      if(!f) return; g_first    = f;
+    g_grp_cap = need;
 }
 
 void library_create(lv_obj_t *root){
@@ -617,7 +714,7 @@ void library_create(lv_obj_t *root){
     lv_obj_remove_style_all(g_list);
     lv_obj_set_pos(g_list, 30, LIST_Y); lv_obj_set_size(g_list, 286, LIST_H);
     lv_obj_set_style_bg_opa(g_list, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_pad_bottom(g_list, 30, 0);
+    lv_obj_set_style_pad_bottom(g_list, 44, 0);   /* round bottom bezel */
     lv_obj_set_style_pad_row(g_list, 4, 0);
     lv_obj_set_flex_flow(g_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
@@ -696,6 +793,11 @@ void library_create(lv_obj_t *root){
     lv_obj_center(g_lhint_lbl);
     lv_timer_create(lhint_timer_cb, 150, NULL);
 
-    lib_alloc_buffers(mdb_load());
+    mdb_load();
+    int total = mdb_total_song_count();          /* size for the FULL catalog: Favourites/Most-Played/Recent
+                                                  * query unfiltered rows (incl. audiobooks), so music-only
+                                                  * count would undersize them */
+    if(total < 0) total = mdb_song_count() > 256 ? mdb_song_count() : 256;   /* COUNT failed -> generous floor, don't undersize */
+    lib_alloc_buffers(total);
     library_reload();
 }

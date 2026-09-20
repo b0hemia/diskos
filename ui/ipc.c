@@ -44,10 +44,12 @@ static unsigned g_rx_frames = 0; /* [g_recov_mu] count of /ui frames received FR
 static unsigned g_generation = 0; /* [g_recov_mu] bumps each time /ui is (re)attached to a new player queue
                                    * (rx_do_reopen) = a new player generation. Lets the v2.40 work-mode
                                    * one-shot re-arm after a player restart. See ipc_generation(). */
-static int g_player_mode = -1;   /* [g_recov_mu] last a607 external-mode reported by the player (8=LOCALPLAYER).
-                                  * -1 = none received THIS player generation -> the player has not yet reached
-                                  * its command dispatcher (post system_init). This is the v2.40 work-mode ORACLE:
-                                  * receiving any a607 = player ready; a607 mode==8 = LOCALPLAYER confirmed set.
+static int g_player_mode = -1;   /* [g_recov_mu] last a607 external-mode announced by the player (8=LOCALPLAYER).
+                                  * -1 = none received THIS player generation. NOTE (RE-verified vs v2.57): a607 is
+                                  * NOT a reliable *solicited* readiness oracle - a 0607 query's reply goes to the
+                                  * /player queue, not /ui; the player only announces a607 to /ui after a 0657 mode
+                                  * CHANGE. Readiness is established by the a2 probe + settle (main.c); when an a607
+                                  * does arrive here, mode==8 is a valid "LOCALPLAYER set" confirmation.
                                   * Reset to -1 on /ui reopen (new player generation). See ipc_player_mode(). */
 static dev_t g_tx_dev = 0;  static ino_t g_tx_ino = 0;   /* [main-thread only] identity of /player g_tx sends to */
 static int g_tx_stale    = 0;   /* [main-thread only] health -> sender: /player recreated, drop g_tx */
@@ -83,10 +85,13 @@ static long tok_long(const char*js, jsmntok_t*t){
 static int tok_bool(const char*js, jsmntok_t*t){
     char b[8]; copy_tok(js,t,b,sizeof b); return (b[0]=='t'||b[0]=='1'||b[0]=='T');
 }
-/* JSON string unescape (handles \" \\ \/ \n \t \r and \uXXXX -> UTF-8 BMP) */
-static void unescape(const char*s,int n,char*dst,int dstsz){
-    int o=0;
-    for(int i=0;i<n && o<dstsz-4;i++){
+/* JSON string unescape (handles \" \\ \/ \n \t \r and \uXXXX -> UTF-8 BMP).
+ * Returns the decoded length on success, or -1 if the input did not fit dst
+ * (truncated). A silently-truncated path can alias a DIFFERENT real file, so
+ * callers that key off the result (e.g. song_file_path) must drop a -1. */
+static int unescape(const char*s,int n,char*dst,int dstsz){
+    int o=0, i=0;
+    for(;i<n && o<dstsz-4;i++){
         if(s[i]!=2 && s[i]==92 && i+1<n){ /* backslash */
             char c=s[++i];
             if(c==110) dst[o++]=10; else if(c==116) dst[o++]=9; else if(c==114) dst[o++]=13;
@@ -100,6 +105,7 @@ static void unescape(const char*s,int n,char*dst,int dstsz){
         } else dst[o++]=s[i];
     }
     dst[o]=0;
+    return (i<n) ? -1 : o;   /* i<n -> stopped on the o limit, input left over = truncated */
 }
 
 /* Zero the current-track fields. Caller must hold g_mu. */
@@ -116,6 +122,7 @@ static void parse_a2(const char*payload,int len){
     int nt=jsmn_parse(&p,payload,len,tk,64);
     if(nt<1) return;
     pthread_mutex_lock(&g_mu);
+    char oldpath[256]; snprintf(oldpath, sizeof oldpath, "%s", g_state.path);   /* detect a track-identity change */
     int v;
     v=find_val(payload,tk,nt,"state");        if(v>=0) g_state.state=(int)tok_long(payload,&tk[v]);
     v=find_val(payload,tk,nt,"playing_num");  if(v>=0) copy_tok(payload,&tk[v],g_state.playing_num,sizeof g_state.playing_num);
@@ -130,19 +137,37 @@ static void parse_a2(const char*payload,int len){
         jsmn_parser p2; jsmntok_t st[96]; jsmn_init(&p2);
         int n2=jsmn_parse(&p2,song,strlen(song),st,96);
         if(n2>0){
-            int sv, got=0;   /* got = we found a REAL track field (name or path) */
-            /* unescape (not copy_tok) every string field: the inner song JSON still
-             * carries its own \/ \" \uXXXX escapes after the outer unescape, so titles
-             * with slashes/quotes/CJK would otherwise render literally (matches path). */
-            sv=find_val(song,st,n2,"song_name");          if(sv>=0){ unescape(song+st[sv].start, st[sv].end-st[sv].start, g_state.title,  sizeof g_state.title);  got=1; }
-            sv=find_val(song,st,n2,"song_artist_name");   if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, g_state.artist, sizeof g_state.artist);
-            sv=find_val(song,st,n2,"song_album_name");    if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, g_state.album,  sizeof g_state.album);
-            sv=find_val(song,st,n2,"song_file_path");     if(sv>=0){ unescape(song+st[sv].start, st[sv].end-st[sv].start, g_state.path,   sizeof g_state.path);   got=1; }
-            sv=find_val(song,st,n2,"song_duration_time"); if(sv>=0) g_state.duration_ms=tok_long(song,&st[sv]);
-            sv=find_val(song,st,n2,"song_sample_rate");   if(sv>=0) g_state.sample_rate=(int)tok_long(song,&st[sv]);
-            sv=find_val(song,st,n2,"is_dsd");             if(sv>=0) g_state.is_dsd=tok_bool(song,&st[sv]);
-            if(got) g_state.have_track=1;
-            else    clear_track();   /* parsed (e.g. "null") but no real song fields -> no track */
+            /* Parse into TEMP state and publish only when the song carries a complete IDENTITY (a valid
+             * path). song_name alone must NOT make it a "track": an omitted song_file_path would otherwise
+             * leave the PREVIOUS path (and path_seq) intact while the title changes, so the new song's
+             * positions would bind to the old track and corrupt its bookmark. unescape (not copy_tok) every
+             * string: the inner song JSON still carries \/ \" \uXXXX after the outer unescape. */
+            char t_title[sizeof g_state.title]={0}, t_artist[sizeof g_state.artist]={0};
+            char t_album[sizeof g_state.album]={0}, t_path[sizeof g_state.path]={0};
+            long t_dur=-1; int t_sr=-1, t_dsd=-1, have_path=0, sv;
+            sv=find_val(song,st,n2,"song_name");          if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, t_title,  sizeof t_title);
+            sv=find_val(song,st,n2,"song_artist_name");   if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, t_artist, sizeof t_artist);
+            sv=find_val(song,st,n2,"song_album_name");    if(sv>=0) unescape(song+st[sv].start, st[sv].end-st[sv].start, t_album,  sizeof t_album);
+            sv=find_val(song,st,n2,"song_file_path");
+            /* a truncated path can alias a DIFFERENT real file -> unescape overflow means NO usable identity */
+            if(sv>=0 && unescape(song+st[sv].start, st[sv].end-st[sv].start, t_path, sizeof t_path) >= 0 && t_path[0]) have_path=1;
+            sv=find_val(song,st,n2,"song_duration_time"); if(sv>=0) t_dur=tok_long(song,&st[sv]);
+            sv=find_val(song,st,n2,"song_sample_rate");   if(sv>=0) t_sr=(int)tok_long(song,&st[sv]);
+            sv=find_val(song,st,n2,"is_dsd");             if(sv>=0) t_dsd=tok_bool(song,&st[sv]);
+            if(have_path){                 /* complete identity -> publish the whole track atomically */
+                snprintf(g_state.path,   sizeof g_state.path,   "%s", t_path);
+                snprintf(g_state.title,  sizeof g_state.title,  "%s", t_title);
+                snprintf(g_state.artist, sizeof g_state.artist, "%s", t_artist);
+                snprintf(g_state.album,  sizeof g_state.album,  "%s", t_album);
+                if(t_dur>=0) g_state.duration_ms=t_dur;
+                if(t_sr>=0)  g_state.sample_rate=t_sr;
+                if(t_dsd>=0) g_state.is_dsd=t_dsd;
+                g_state.have_track=1;
+            } else {
+                /* a present song with NO usable path can't establish identity -> clear rather than bind new
+                 * positions to the previous track (which would corrupt its bookmark). */
+                clear_track();
+            }
         }
     } else if(v>=0 && tk[v].type==JSMN_STRING){
         /* "song" present as an empty/short STRING ("{}"/"" -> len<=2): the player is
@@ -159,6 +184,7 @@ static void parse_a2(const char*payload,int len){
         clear_track();
     }
     g_state.seq++;
+    if(strcmp(oldpath, g_state.path) != 0) g_state.path_seq = g_state.seq;   /* track changed -> new identity epoch */
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -171,11 +197,19 @@ static int all_hex(const char*s,int n){
 
 static void parse_frame(const char*buf,int n){
     if(n<8) return;
-    if(buf[0]==97 && buf[1]==49){ /* "a1" position */
-        char h[16]={0}; int pn=n-8; if(pn>15)pn=15; memcpy(h,buf+8,pn);
-        if(!all_hex(h,pn)) return;   /* malformed -> keep last position, don't reset to 0 */
-        long ms=strtol(h,0,16);
-        pthread_mutex_lock(&g_mu); g_state.position_ms=ms; g_state.seq++; pthread_mutex_unlock(&g_mu);
+    if(buf[0]==97 && buf[1]==49){ /* "a1<type2><len4><payload>" position, e.g. a1030010 + 8-hex ms */
+        if(n<8) return;
+        char lh[5]={buf[4],buf[5],buf[6],buf[7],0};
+        if(!all_hex(lh,4)) return;               /* no valid length field -> reject */
+        int flen=(int)strtol(lh,0,16);           /* advertised TOTAL frame length (chars) */
+        if(flen<9 || n<flen) return;             /* TRUNCATED (fewer chars than advertised) -> keep last position,
+                                                  * never publish a short/bogus value that could corrupt a bookmark */
+        int pn=flen-8; if(pn>15) return;         /* payload wider than a position value -> not a position frame */
+        char h[16]={0}; memcpy(h,buf+8,pn);
+        if(!all_hex(h,pn)) return;               /* malformed payload -> keep last position */
+        errno=0; long ms=strtol(h,0,16);
+        if(errno==ERANGE || ms<0) return;        /* overflow/negative -> reject, don't publish garbage */
+        pthread_mutex_lock(&g_mu); g_state.position_ms=ms; g_state.seq++; g_state.pos_seq=g_state.seq; pthread_mutex_unlock(&g_mu);
     } else if(buf[0]==97 && buf[1]==50){ /* "a2" state/metadata JSON */
         parse_a2(buf+8, n-8);
     } else if(buf[0]=='a'&&buf[1]=='7'&&buf[2]=='1'&&buf[3]=='4' && n>=12){
@@ -185,18 +219,18 @@ static void parse_frame(const char*buf,int n){
         int v=(int)strtol(h,0,16);
         pthread_mutex_lock(&g_mu); g_state.volume=v; g_state.volume_seq++; pthread_mutex_unlock(&g_mu);
     } else if(buf[0]=='a'&&buf[1]=='6'&&buf[2]=='0'&&buf[3]=='7' && n>=12){
-        /* "a607000C<MODE>" - the player's current external/input mode: a reply to our 0607 query, or an
-         * unsolicited announce after a 0657 setter. MODE 0008 = LOCALPLAYER. This is the v2.40 work-mode
-         * oracle (see g_player_mode): any a607 proves the player is at its command dispatcher; ==8 confirms
-         * LOCALPLAYER is set. VALUE is the 4 hex chars after the 000C length (buf[8..11]). */
+        /* "a607000C<MODE>" - the player's external/input mode, announced to /ui after a 0657 mode CHANGE.
+         * (A 0607 query's reply goes to the /player queue, NOT here, so we do NOT rely on soliciting it - see
+         * g_player_mode.) MODE 0008 = LOCALPLAYER; when this arrives, ==8 confirms LOCALPLAYER is set. VALUE is
+         * the 4 hex chars after the 000C length (buf[8..11]). */
         char h[5]={buf[8],buf[9],buf[10],buf[11],0};
         if(!all_hex(h,4)) return;
         int mode=(int)strtol(h,0,16);
         pthread_mutex_lock(&g_recov_mu); g_player_mode=mode; pthread_mutex_unlock(&g_recov_mu);
     }
     /* NB: for playback the player emits a1/a2/a714 to /ui (a2=state/love/work_mode/track, a1=position,
-     * a714=volume) - no a622/a639/a704 completion replies. SEPARATELY, a 0607 query (or a 0657 setter)
-     * makes it emit a607 (external/input mode) - the v2.40 work-mode oracle, parsed above. */
+     * a714=volume) - no a622/a639/a704 completion replies. SEPARATELY, a 0657 mode CHANGE makes it announce
+     * a607 (external/input mode) to /ui, parsed above (a bare 0607 query replies on /player, not /ui). */
 }
 
 static char  *g_rxbuf = NULL;
@@ -205,11 +239,14 @@ static size_t g_rxbufsz = 0;
 /* RX thread only: reattach g_rx to the CURRENT named /ui after the player recreated it.
  * Open-before-close so there's never a descriptor-less gap; no O_CREAT (the player owns
  * recreation - if it's momentarily absent we retry on the next wake). */
-static void rx_do_reopen(void){
+/* Returns 0 once g_rx holds a fresh valid descriptor, -1 if the reopen could not complete
+ * (queue transiently absent / new msgsize won't fit) - g_rx is then UNCHANGED and still
+ * invalid, so the caller MUST back off rather than immediately re-receiving (else 100% CPU). */
+static int rx_do_reopen(void){
     pthread_mutex_lock(&g_recov_mu); g_rx_reopen = 0; pthread_mutex_unlock(&g_recov_mu);
     mqd_t nw = mq_open("/ui", O_RDONLY);
     if(nw==(mqd_t)-1){   /* transient ENOENT (player mid-recreate) -> retry next wake */
-        pthread_mutex_lock(&g_recov_mu); g_rx_reopen = 1; pthread_mutex_unlock(&g_recov_mu); return;
+        pthread_mutex_lock(&g_recov_mu); g_rx_reopen = 1; pthread_mutex_unlock(&g_recov_mu); return -1;
     }
     struct mq_attr at;
     if(mq_getattr(nw,&at)==0 && at.mq_msgsize>0 && (size_t)at.mq_msgsize > g_rxbufsz){
@@ -220,7 +257,7 @@ static void rx_do_reopen(void){
                   * queue vs the 8200 buffer floor, but must not silently install an unreadable fd.) */
             mq_close(nw);
             pthread_mutex_lock(&g_recov_mu); g_rx_reopen = 1; pthread_mutex_unlock(&g_recov_mu);
-            return;
+            return -1;
         }
     }
     mqd_t old = g_rx;
@@ -229,8 +266,12 @@ static void rx_do_reopen(void){
     pthread_mutex_lock(&g_recov_mu);
     g_rx_dev = d; g_rx_ino = io; g_rx_ready = 1; g_reconnected = 1; g_player_mode = -1; g_generation++;  /* new player gen */
     pthread_mutex_unlock(&g_recov_mu);
-    if(old!=(mqd_t)-1) mq_close(old);       /* open-before-close: no descriptor-less gap */
+    if(old!=(mqd_t)-1 && old!=nw) mq_close(old);   /* open-before-close, but NEVER close a descriptor number
+                                                    * the new mq_open reused (EBADF path: the old fd was dead,
+                                                    * so its number can come back as nw - closing it kills the
+                                                    * fresh queue and re-spins EBADF). */
     fprintf(stderr,"ipc: /ui reattached after player restart\n");
+    return 0;
 }
 
 static void *ipc_thread(void*arg){
@@ -248,7 +289,7 @@ static void *ipc_thread(void*arg){
         if(n>=0){ pthread_mutex_lock(&g_recov_mu); g_rx_frames++; pthread_mutex_unlock(&g_recov_mu); parse_frame(g_rxbuf,(int)n); }
         else if(errno==ETIMEDOUT) continue;   /* normal idle wake */
         else if(errno==EINTR) continue;
-        else if(errno==EBADF){ rx_do_reopen(); }  /* lost fd -> reattach now (we're on the RX thread) */
+        else if(errno==EBADF){ if(rx_do_reopen()!=0) usleep(50000); }  /* lost fd -> reattach now (we're on the RX thread); if the queue is still absent, back off 50ms instead of busy-spinning on the dead fd */
         else usleep(50000);                   /* unexpected error: back off rather than spin */
     }
     return 0;

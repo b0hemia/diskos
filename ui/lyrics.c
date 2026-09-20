@@ -290,6 +290,7 @@ void lyrics_create(lv_obj_t *root)
     g_scroll = lv_obj_create(root);
     lv_obj_remove_style_all(g_scroll);
     lv_obj_set_pos(g_scroll, 40, 76); lv_obj_set_size(g_scroll, 280, 250);
+    lv_obj_set_style_pad_bottom(g_scroll, 44, 0);   /* last lyric lines scroll clear of the round bezel */
     lv_obj_set_style_bg_opa(g_scroll, LV_OPA_TRANSP, 0);
     lv_obj_set_scroll_dir(g_scroll, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(g_scroll, LV_SCROLLBAR_MODE_OFF);

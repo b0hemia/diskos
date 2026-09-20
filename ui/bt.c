@@ -28,12 +28,15 @@
 
 static lv_obj_t *g_sw, *g_list, *g_info_list;
 static lv_timer_t *g_scan_timer;
+static lv_timer_t *g_scanwait_timer;   /* bt_open's non-destructive "wait for adapter then scan" poll */
+static uint32_t    g_scanwait_start;
 static lv_timer_t *g_bt_autoroute_timer;
 static char g_sel_mac[20];     /* device selected for the details screen */
 static char g_bt_autorouted[20];
 
 static void start_scan(void);             /* fwd */
 static void scan_timer_cb(lv_timer_t *t);  /* fwd */
+static void scan_abort(void);             /* fwd */
 static void scan_kick(void);              /* fwd - off-thread re-enumerate (no discovery window) */
 static void bt_autoroute_start(void);      /* fwd */
 static void bt_autoroute_stop(void);       /* fwd */
@@ -112,6 +115,27 @@ static int bt_on(void){
     return strstr(s, "Powered: yes") != NULL;
 }
 
+/* Cheap "is the BT radio enabled?" for the status icon + QS tile: reads the bluetooth rfkill soft-block
+ * from /sys (no process spawn). Reflects reality regardless of who set it - diskOS bt_disable() rfkill-
+ * blocks, and the stock boot can bring BT up per its own SYSCONFIG - unlike the persisted cfg intent,
+ * which goes stale when the stock firmware enables BT out from under us. Falls back to the intent if no
+ * bluetooth rfkill node exists. */
+int bt_radio_on(void){
+    int found = 0;
+    for(int i = 0; i < 12; i++){
+        char p[64]; snprintf(p, sizeof p, "/sys/class/rfkill/rfkill%d/type", i);
+        FILE *f = fopen(p, "r"); if(!f) continue;
+        char t[16] = {0}; char *r = fgets(t, sizeof t, f); fclose(f);
+        if(!r || strncmp(t, "bluetooth", 9) != 0) continue;
+        found = 1;
+        snprintf(p, sizeof p, "/sys/class/rfkill/rfkill%d/soft", i);
+        f = fopen(p, "r"); if(!f) continue;
+        int soft = 1; if(fscanf(f, "%d", &soft) != 1) soft = 1; fclose(f);
+        if(soft != 0) return 0;   /* any bluetooth rfkill soft-blocked -> BT off */
+    }
+    return found ? 1 : cfg_get_int("bt_on", 0);
+}
+
 /* ---- enable / disable --------------------------------------------------- */
 /* idempotent: ensure the pairing agent + a2dp-source audio endpoint are up.
  * Must run whenever the radio is on - without bt-agent pairing fails, and
@@ -171,6 +195,8 @@ static void bt_enable(void){
      * bluetoothd), not here, so it never races the patchram attach. */
 }
 static void bt_disable(void){
+    scan_abort();          /* cancel any pending/active scan + the bt_open observer (covers the radio-timeout
+                            * OFF path, which reaches here without a caller-side scan_abort) */
     bt_autoroute_stop();
     system("rm -f /tmp/bt_enabling; "     /* cancel any in-flight bt_enable() subshell first */
            "bluetoothctl power off >/dev/null 2>&1; hciconfig hci0 down >/dev/null 2>&1; "
@@ -196,6 +222,9 @@ static int bt_mac_valid(const char *mac){
  * PCM exists preserves a manual switch back to analog until the sink reconnects. */
 static void bt_autoroute_poll_cb(lv_timer_t *t){
     (void)t;
+    /* The post-restart settle guard lives in ui_route_bt (covers every routing path); this poll keeps
+     * firing during the window and routes on the first tick past it (ui_route_bt returns "not routed"
+     * meanwhile, so g_bt_autorouted is not latched and the retry stands). */
     char path[256], mac[20];
     int found = 0;
     FILE *p = popen("bluealsa-cli list-pcms 2>/dev/null | grep -m1 a2dpsrc", "r");
@@ -228,6 +257,13 @@ static void bt_autoroute_start(void){
 static void bt_autoroute_stop(void){
     if(g_bt_autoroute_timer){ lv_timer_del(g_bt_autoroute_timer); g_bt_autoroute_timer = NULL; }
     g_bt_autorouted[0] = 0;
+}
+/* The player restarted: a fresh mq_player defaults to local/analog output, so any "already routed to X"
+ * memory is stale. Forget it so the auto-route poll re-routes the still-connected speaker (and so the
+ * local re-init isn't wrongly suppressed). If BT is on but the poll timer died, re-arm it. */
+void bt_notify_player_restart(void){
+    g_bt_autorouted[0] = 0;
+    if(bt_on() && !g_bt_autoroute_timer) bt_autoroute_start();
 }
 
 /* ---- pair + connect ----------------------------------------------------- */
@@ -283,7 +319,7 @@ static void bt_conn_poll_cb(lv_timer_t *t){
             snprintf(g_bt_autorouted, sizeof g_bt_autorouted, "%s", g_bt_conn_mac);
             ui_toast("Connected");
         } else {
-            ui_toast("Paired \xE2\x80\x93 audio stays on player");
+            ui_toast("Paired - audio stays on player");
         }
         scan_kick();                        /* instant re-list (device already known) -> ✓, no 13s re-scan */
         return;
@@ -337,8 +373,37 @@ static void info_row(const char *key, const char *val){
     lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(v, 96, 11); lv_obj_set_size(v, 142, 18);
     lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_style_text_font(v, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(v, ui_font_cjk(14), 0);   /* "Name" value = device name: Cyrillic/CJK-capable (issue #3) */
     lv_obj_set_style_text_color(v, lv_color_hex(0xFFFFFF), 0);
+}
+/* Forget (unpair + untrust) the selected device, then return to the list + rescan (C13). */
+static void info_forget_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    if(bt_mac_valid(g_sel_mac)){
+        bt_disconnect(g_sel_mac);   /* route audio back to analog + clear g_route/autoroute BEFORE removing the sink */
+        char cmd[128];
+        snprintf(cmd, sizeof cmd, "bluetoothctl remove %s >/dev/null 2>&1", g_sel_mac);
+        ui_toast(system(cmd) == 0 ? "Device forgotten" : "Couldn't forget device");
+    }
+    screen_back();
+    if(g_scan_timer) lv_timer_del(g_scan_timer);
+    g_scan_timer = lv_timer_create(scan_timer_cb, 3000, NULL);
+    lv_timer_set_repeat_count(g_scan_timer, 1);
+}
+static void info_action_row(const char *label, lv_event_cb_t cb){
+    lv_obj_t *r = lv_button_create(g_info_list);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_size(r, 250, 44);
+    lv_obj_set_style_radius(r, 8, 0);
+    lv_obj_set_style_bg_color(r, lv_color_hex(0x2A1416), 0);
+    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(r, lv_color_hex(0x3A1C1E), LV_STATE_PRESSED);
+    lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(r, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *t = lv_label_create(r);
+    lv_label_set_text(t, label); lv_obj_center(t);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(0xFF453A), 0);
 }
 static void info_disc_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
@@ -395,6 +460,7 @@ void bt_info_open(void){
       info_row("Paired",    (bt_info_prop(buf,"Paired:",   v,sizeof v) && !strcmp(v,"yes")) ? "Yes" : "No");
       if(bt_info_prop(buf,"Icon:",v,sizeof v)) info_row("Type", v); }
     info_row("Audio", "On (beta)");   /* routing works; SBC over this CPU can be rough. short: value label is 142px */
+    info_action_row("Forget This Device", info_forget_cb);   /* C13: unpair + untrust */
     screen_show(SCR_BT_INFO);
 }
 
@@ -447,7 +513,7 @@ static void add_dev_row(const char *mac, const char *name, int connected){
     lv_label_set_text(t, name);
     lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(t, tx, 13); lv_obj_set_size(t, 232 - tx, 20);
-    lv_obj_set_style_text_font(t, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(t, ui_font_cjk(16), 0);   /* BT device names are user data: Cyrillic/CJK-capable (issue #3) */
     lv_obj_set_style_text_color(t, lv_color_hex(0xFFFFFF), 0);
 
     lv_obj_t *ic = lv_label_create(r);
@@ -595,6 +661,7 @@ static void scan_timer_cb(lv_timer_t *t){
 static void scan_abort(void){
     if(g_scan_timer){ lv_timer_del(g_scan_timer); g_scan_timer = NULL; }
     if(g_scanpoll_timer){ lv_timer_del(g_scanpoll_timer); g_scanpoll_timer = NULL; }
+    if(g_scanwait_timer){ lv_timer_del(g_scanwait_timer); g_scanwait_timer = NULL; }  /* cancel the bt_open observer too */
     pthread_mutex_lock(&g_scan_mu);
     g_scan_gen++; g_scan_running = 0; g_scan_n = 0; g_scan_done = 0;
     pthread_mutex_unlock(&g_scan_mu);
@@ -628,6 +695,13 @@ static void radio_on_poll_cb(lv_timer_t *t){
     }
     if(lv_tick_elaps(g_radio_start) > 28000){   /* 2s rfkill + ~20s up-loop + daemon/power settle */
         lv_timer_del(g_radio_timer); g_radio_timer = NULL;
+        /* bring-up failed: drop the persisted intent so the QS tile + boot-restore don't keep
+         * showing/enforcing "on" for a radio that never came up. Tear the stack down so the cleared
+         * intent matches a real off state (a late/half-started enable can't linger powered), and
+         * sync the screen switch. */
+        cfg_set_int("bt_on", 0);
+        if(g_sw) lv_obj_clear_state(g_sw, LV_STATE_CHECKED);
+        bt_disable();
         list_msg("Couldn't turn on Bluetooth");
     }
 }
@@ -639,6 +713,7 @@ static void sw_cb(lv_event_t *e){
         bt_enable();
         list_msg("Turning on " LV_SYMBOL_BLUETOOTH);
         g_radio_start = lv_tick_get();
+        if(g_scanwait_timer){ lv_timer_del(g_scanwait_timer); g_scanwait_timer = NULL; }  /* radio poll owns bring-up now - keep the two mutually exclusive */
         if(g_radio_timer) lv_timer_del(g_radio_timer);
         g_radio_timer = lv_timer_create(radio_on_poll_cb, 1000, NULL);
     } else {
@@ -655,7 +730,7 @@ static void sw_cb(lv_event_t *e){
 /* Quick Settings tile short-press: flip BT + persist intent, no screen-specific UI.
  * Mirrors sw_cb's actions (bt_boot_restore/keepalive enforce the intent). Returns new state. */
 int bt_toggle(void){
-    int on = !cfg_get_int("bt_on", 0);
+    int on = !bt_radio_on();   /* flip the ACTUAL radio state, not the (possibly stale) persisted intent */
     cfg_set_int("bt_on", on);
     if(on){
         bt_enable();
@@ -668,6 +743,7 @@ int bt_toggle(void){
     }
     /* keep the BT screen's switch in sync so it reflects reality when opened later */
     if(g_sw){ if(on) lv_obj_add_state(g_sw, LV_STATE_CHECKED); else lv_obj_clear_state(g_sw, LV_STATE_CHECKED); }
+    ui_status_refresh();   /* update the home BT icon immediately (don't wait for the next status poll) */
     return on;
 }
 
@@ -765,6 +841,7 @@ void bt_create(lv_obj_t *root){
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);
     lv_obj_set_pos(g_list, 40, 134); lv_obj_set_size(g_list, 280, 184);
+    lv_obj_set_style_pad_bottom(g_list, 44, 0);   /* last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(g_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_row(g_list, 6, 0);
     lv_obj_set_flex_flow(g_list, LV_FLEX_FLOW_COLUMN);
@@ -774,12 +851,52 @@ void bt_create(lv_obj_t *root){
     lv_obj_add_flag(g_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 }
 
+/* Non-destructive "wait for the adapter, then scan" poll used when the BT screen is opened while the
+ * radio is on/coming up (from a QS toggle, or brought up externally). Unlike radio_on_poll_cb it NEVER
+ * powers BT off on a timeout - it just stops trying, so a flaky bt_on() probe can't kill a live radio. */
+static void scanwait_poll_cb(lv_timer_t *t){
+    (void)t;
+    if(screen_current() != SCR_BT){                 /* user left the BT screen -> stop waiting */
+        lv_timer_del(g_scanwait_timer); g_scanwait_timer = NULL; return;
+    }
+    if(bt_on()){
+        lv_timer_del(g_scanwait_timer); g_scanwait_timer = NULL;
+        bt_ensure_services(); bt_autoroute_start(); start_scan();
+        return;
+    }
+    if(lv_tick_elaps(g_scanwait_start) > 28000){    /* gave up waiting - do NOT tear the radio down */
+        lv_timer_del(g_scanwait_timer); g_scanwait_timer = NULL;
+        list_msg(bt_radio_on() ? "Bluetooth is starting up" : "Bluetooth is off");
+    }
+}
+
 void bt_open(void){
+    /* "should BT be on" = the intent OR the live radio. Intent is the reliable signal right after a QS
+     * toggle, because bt_enable() rfkill-blocks-then-unblocks, so bt_radio_on() reads 0 for a moment. */
+    int want = cfg_get_int("bt_on", 0) || bt_radio_on();
     if(g_sw){
-        if(bt_on()) lv_obj_add_state(g_sw, LV_STATE_CHECKED);
-        else        lv_obj_clear_state(g_sw, LV_STATE_CHECKED);
+        if(want) lv_obj_add_state(g_sw, LV_STATE_CHECKED);
+        else     lv_obj_clear_state(g_sw, LV_STATE_CHECKED);
     }
     screen_show(SCR_BT);
-    if(bt_on()){ bt_ensure_services(); bt_autoroute_start(); start_scan(); }
-    else         list_msg("Bluetooth is off");
+    /* bt_open is authoritative for this screen entry: cancel any in-flight bring-up observer (sw_cb's radio
+     * poll or a prior scanwait) BEFORE deciding a path, so none of the branches below can race a pending
+     * timer into a second start_scan() (e.g. reopen after the radio powered up but before g_radio_timer
+     * fired would otherwise scan here AND on the next poll tick). */
+    if(g_radio_timer){ lv_timer_del(g_radio_timer); g_radio_timer = NULL; }
+    if(g_scanwait_timer){ lv_timer_del(g_scanwait_timer); g_scanwait_timer = NULL; }
+    if(bt_on()){                                   /* fully up -> scan immediately */
+        bt_ensure_services(); bt_autoroute_start(); start_scan();
+    } else if(want){                                /* on/coming up (e.g. just toggled from Quick Settings)
+                                                     * -> poll until Powered, then scan. NON-destructive:
+                                                     * unlike radio_on_poll_cb, this never powers BT off on a
+                                                     * timeout, so observing an externally-enabled radio (or a
+                                                     * flaky bt_on() probe) can't kill a working controller. */
+        list_msg_scanning();
+        g_scanwait_start = lv_tick_get();
+        if(g_scanwait_timer) lv_timer_del(g_scanwait_timer);
+        g_scanwait_timer = lv_timer_create(scanwait_poll_cb, 1000, NULL);
+    } else {
+        list_msg("Bluetooth is off");
+    }
 }

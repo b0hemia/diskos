@@ -276,11 +276,24 @@ static void wifi_connect(const char *ssid, const char *key){
     char cmd[512], buf[2048];
     int id = -1;
     run_cap(WCLI "list_networks 2>/dev/null", buf, sizeof buf);
-    char *l = buf;
+    char *l = strchr(buf, '\n'); if(l) l++;               /* skip the header row */
+    size_t slen = strlen(ssid);
     while(l && *l){
-        int nid; char nssid[64];
-        if(sscanf(l, "%d\t%63[^\t]", &nid, nssid) == 2 && !strcmp(nssid, ssid)){ id = nid; break; }
-        l = strchr(l, '\n'); if(l) l++;
+        /* exact SSID match by literal-tab field split. sscanf("%d\t%63[^\t]") swallowed leading
+         * whitespace in the SSID, so " Home" and "Home" compared equal - selecting one could
+         * reconfigure the other saved profile. Split on the real tabs instead. */
+        char *nl = strchr(l, '\n');
+        char *t1 = strchr(l, '\t');                       /* end of id field */
+        if(t1 && (!nl || t1 < nl)){
+            char *sfld = t1 + 1;                          /* ssid field */
+            char *t2 = strchr(sfld, '\t');                /* the SSID is always followed by a tab (bssid) */
+            /* require a COMPLETE ssid field: a truncated capture ("17\tHom") must NOT match a shorter
+             * prefix of a longer real SSID (e.g. select "Home" and reconfigure saved "HomeOffice"). */
+            if(t2 && (!nl || t2 < nl) && (size_t)(t2 - sfld) == slen && memcmp(sfld, ssid, slen) == 0){
+                id = atoi(l); break;
+            }
+        }
+        l = nl ? nl + 1 : NULL;
     }
     if(id < 0){
         char idbuf[32];
@@ -353,7 +366,7 @@ static void info_row(const char *key, const char *val){
     lv_label_set_long_mode(v, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(v, 110, 11); lv_obj_set_size(v, 128, 18);
     lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_style_text_font(v, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_font(v, ui_font_cjk(14), 0);   /* "Network" value = SSID: Cyrillic/CJK-capable (issue #3) */
     lv_obj_set_style_text_color(v, lv_color_hex(0xFFFFFF), 0);
 }
 static void info_back_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_back(); }
@@ -365,6 +378,7 @@ void wifi_info_create(lv_obj_t *root){
     g_info_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_info_list);
     lv_obj_set_pos(g_info_list, 55, 84); lv_obj_set_size(g_info_list, 250, 230);
+    lv_obj_set_style_pad_bottom(g_info_list, 44, 0);   /* last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(g_info_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_row(g_info_list, 8, 0);
     lv_obj_set_flex_flow(g_info_list, LV_FLEX_FLOW_COLUMN);
@@ -374,11 +388,68 @@ void wifi_info_create(lv_obj_t *root){
     lv_obj_add_flag(g_info_list, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 }
 
+/* A tappable destructive-action row appended to the details list (Forget). */
+static void info_action_row(const char *label, lv_event_cb_t cb){
+    lv_obj_t *r = lv_button_create(g_info_list);
+    lv_obj_remove_style_all(r);
+    lv_obj_set_size(r, 250, 44);
+    lv_obj_set_style_radius(r, 8, 0);
+    lv_obj_set_style_bg_color(r, lv_color_hex(0x2A1416), 0);
+    lv_obj_set_style_bg_opa(r, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_color(r, lv_color_hex(0x3A1C1E), LV_STATE_PRESSED);
+    lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(r, cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *t = lv_label_create(r);
+    lv_label_set_text(t, label); lv_obj_center(t);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(t, lv_color_hex(0xFF453A), 0);
+}
+static char g_info_ssid[64];   /* the exact SSID shown on the details screen (retained for Forget) */
+/* Remove EVERY saved network whose SSID EXACTLY equals `ssid`, then persist. 1 if any removed.
+ * list_networks is TAB-separated (id\tssid\tbssid\tflags); we split on literal tabs and compare the
+ * exact ssid field - NOT sscanf "%[^\t]" after a "\t", which would swallow a leading space so " Home"
+ * and "Home" collide and Forget could delete the wrong network. */
+static int wifi_remove_ssid(const char *ssid){
+    if(!wpa_ready() || !ssid || !ssid[0]) return 0;
+    char buf[4096]; run_cap(WCLI "list_networks 2>/dev/null", buf, sizeof buf);
+    char *l = strchr(buf, '\n'); if(l) l++;               /* skip the header row */
+    size_t slen = strlen(ssid);
+    int removed = 0, failed = 0;
+    while(l && *l){
+        char *nl = strchr(l, '\n');
+        char *t1 = strchr(l, '\t');                       /* end of id field */
+        if(t1 && (!nl || t1 < nl)){
+            char *sfld = t1 + 1;                           /* ssid field start */
+            char *t2 = strchr(sfld, '\t');                 /* end of ssid field (always a tab: bssid follows) */
+            /* require a COMPLETE ssid field so a truncated capture can't match a shorter prefix of a longer real SSID. */
+            if(t2 && (!nl || t2 < nl) && (size_t)(t2 - sfld) == slen && memcmp(sfld, ssid, slen) == 0){
+                int nid = atoi(l);
+                /* wpa_cli prints OK/FAIL and exits 0 either way, so check its output, not the
+                 * shell rc - otherwise a failed remove would still report "forgotten". */
+                char cmd[80]; snprintf(cmd, sizeof cmd, WCLI "remove_network %d 2>/dev/null", nid);
+                char out[64]; run_cap(cmd, out, sizeof out);
+                if(strstr(out, "OK")) removed = 1; else failed = 1;   /* a duplicate-SSID profile we could not remove -> report failure */
+            }
+        }
+        l = nl ? nl + 1 : NULL;
+    }
+    if(removed){
+        char so[64]; run_cap(WCLI "save_config 2>/dev/null", so, sizeof so);
+        if(!strstr(so, "OK")) failed = 1;   /* removed from the running config but not persisted (it returns on reboot) */
+    }
+    return removed && !failed;   /* success only when something was removed AND nothing failed */
+}
+static void wifi_forget_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    ui_toast(wifi_remove_ssid(g_info_ssid) ? "Network forgotten" : "Couldn't forget network");
+    wifi_open();   /* back to the list + fresh scan */
+}
 void wifi_info_open(void){
     if(!g_info_list) return;
     lv_obj_clean(g_info_list);
     char ssid[64], ip[32], buf[2048], val[64], gw[32];
     wifi_status(ssid, sizeof ssid, ip, sizeof ip);
+    snprintf(g_info_ssid, sizeof g_info_ssid, "%s", ssid);   /* retain for Forget (don't re-read on click) */
     info_row("Network", ssid);
     info_row("IP Address", ip);
     if(get_gateway(gw, sizeof gw)) info_row("Router", gw);
@@ -392,6 +463,7 @@ void wifi_info_open(void){
     if(p){ int fr; if(sscanf(p+6,"%d",&fr)==1){ snprintf(val,sizeof val,"%d MHz", fr); info_row("Frequency", val);} }
     p = strstr(buf, "bssid=");
     if(p && sscanf(p+6, "%63[^\n]", val)==1){ info_row("BSSID", val); }   /* check sscanf: val was read uninitialized on no-match */
+    info_action_row("Forget This Network", wifi_forget_cb);   /* C05: remove the saved network */
     screen_show(SCR_WIFI_INFO);
 }
 
@@ -459,7 +531,7 @@ static void add_net_row(const char *ssid, int signal, int secured, int connected
     lv_label_set_text(t, ssid);
     lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
     lv_obj_set_pos(t, tx, 13); lv_obj_set_size(t, 202 - tx, 20);
-    lv_obj_set_style_text_font(t, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(t, ui_font_cjk(16), 0);   /* SSIDs are user data: Cyrillic/CJK-capable (issue #3) */
     lv_obj_set_style_text_color(t, lv_color_hex(0xFFFFFF), 0);
 
     if(secured){
@@ -648,6 +720,7 @@ void wifi_create(lv_obj_t *root){
     g_list = lv_obj_create(root);
     lv_obj_remove_style_all(g_list);
     lv_obj_set_pos(g_list, 40, 126); lv_obj_set_size(g_list, 280, 192);
+    lv_obj_set_style_pad_bottom(g_list, 44, 0);   /* last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(g_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_row(g_list, 6, 0);
     lv_obj_set_flex_flow(g_list, LV_FLEX_FLOW_COLUMN);

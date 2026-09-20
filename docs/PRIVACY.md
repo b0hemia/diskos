@@ -1,8 +1,8 @@
 # diskOS privacy and network disclosure
 
-This lists everything the installer and the diskOS UI (`mq_ui`) send over the network. The UI ships
-as a binary-only component (source not yet published), so this is a good-faith disclosure based on the
-code and observed behaviour, not a guarantee; it will be tightened when the UI source is published.
+This lists everything the installer and the diskOS UI (`mq_ui`) send over the network. The UI source
+is published under GPL-3.0-or-later in [`ui/`](../ui/); this disclosure is based on that code and on
+observed behaviour. It is a good-faith summary, not a guarantee - read the source for the last word.
 
 ## The installer (this repo)
 

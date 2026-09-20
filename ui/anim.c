@@ -25,13 +25,13 @@ static void exec_zoom(void *o, int32_t v){
 
 static void start(lv_obj_t *o, lv_anim_exec_xcb_t xcb, int from, int to,
                   uint32_t ms, lv_anim_path_cb_t path, lv_anim_completed_cb_t done){
+    lv_anim_delete(o, xcb);   /* replace our OWN running anim first, so it frees a slot before the budget check */
     if(lv_anim_count_running() >= ANIM_MAX_ACTIVE){
-        /* over budget: snap to end state, fire done synchronously */
+        /* genuinely over budget (from OTHER objects): snap to end state, fire done synchronously */
         xcb(o, to);
         if(done){ lv_anim_t tmp; lv_anim_init(&tmp); tmp.var=o; done(&tmp); }
         return;
     }
-    lv_anim_delete(o, xcb);
     lv_anim_t a; lv_anim_init(&a);
     lv_anim_set_var(&a, o);
     lv_anim_set_values(&a, from, to);
@@ -75,24 +75,25 @@ void anim_panel_shadow(lv_obj_t *root){
     lv_obj_set_style_border_opa(root, 26, 0);   /* ~10% */
 }
 
-/* Like start(), but with the EXPONENTIAL EASE-OUT path (cubic-bezier 0.16,1,0.3,1) - the
- * "confident arrival" curve: most of the distance is covered fast, then a long gentle settle. This
- * is what makes a transition feel premium instead of the sluggish slow-start of ease-in-out. */
+/* Like start(), but with a cubic EASE-OUT path (cubic-bezier 0.33,1,0.68,1) - the "confident arrival"
+ * curve: most of the distance is covered fast, then a gentle settle, but LESS front-loaded than expo so
+ * it doesn't cram the motion into a couple of frames on this ~30fps software renderer. One curve for
+ * every screen transition = a cohesive motion language. */
 static void start_expo(lv_obj_t *o, lv_anim_exec_xcb_t xcb, int from, int to,
                        uint32_t ms, lv_anim_completed_cb_t done){
+    lv_anim_delete(o, xcb);   /* replace our OWN running anim first, so it frees a slot before the budget check */
     if(lv_anim_count_running() >= ANIM_MAX_ACTIVE){
         xcb(o, to);
         if(done){ lv_anim_t tmp; lv_anim_init(&tmp); tmp.var=o; done(&tmp); }
         return;
     }
-    lv_anim_delete(o, xcb);
     lv_anim_t a; lv_anim_init(&a);
     lv_anim_set_var(&a, o);
     lv_anim_set_values(&a, from, to);
     lv_anim_set_duration(&a, ms);
     lv_anim_set_exec_cb(&a, xcb);
     lv_anim_set_path_cb(&a, lv_anim_path_custom_bezier3);
-    LV_ANIM_SET_EASE_OUT_EXPO(&a);            /* (0.16, 1, 0.3, 1) */
+    LV_ANIM_SET_EASE_OUT_CUBIC(&a);           /* (0.33, 1, 0.68, 1) */
     a.user_data = (void*)done;
     lv_anim_set_completed_cb(&a, on_done);
     lv_anim_start(&a);

@@ -61,7 +61,7 @@ index e08a5df..91cf6a3 100755
 -		hang();
 +	if(((val & 0xf) != 0x3)) {
 +		ddr_diag_fail(30 /*CALIB_DONE*/, val);
-+		ddr_writel(0, DDRP_INNOPHY_TRAINING_CTRL); /* clear training on failure (Codex) */
++		ddr_writel(0, DDRP_INNOPHY_TRAINING_CTRL); /* clear training on failure */
  	}
  
  	ddr_writel(0, DDRP_INNOPHY_TRAINING_CTRL);

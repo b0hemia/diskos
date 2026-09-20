@@ -21,6 +21,10 @@ typedef struct {
     int  volume;      /* 0..VOL_MAX, from a714 frames */
     unsigned volume_seq; /* bumps on each volume update (drives the on-screen bar) */
     unsigned seq;
+    unsigned path_seq;   /* value of seq when path last CHANGED (a track-identity epoch) */
+    unsigned pos_seq;    /* value of seq when position was last reported (an a1 frame). pos_seq > path_seq
+                          * means the current position was reported AFTER the current track loaded, i.e. it
+                          * belongs to this track and not a stale one - used to gate audiobook checkpoints. */
 } track_state_t;
 
 #define VOL_MAX 120   /* device MAX_VOL (sysconfig); a714 VV is on this same 0..120 scale */

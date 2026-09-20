@@ -27,7 +27,7 @@
 
 #define DBG "/usr/project/diskos-debug.sh"
 
-static lv_obj_t *g_title, *g_ssh, *g_pw, *g_serial, *g_warn, *g_btnlbl;
+static lv_obj_t *g_ssh, *g_pw, *g_serial, *g_warn, *g_btnlbl;
 static int  g_on = 0;
 static char g_pwtext[16] = "";
 
@@ -180,11 +180,8 @@ void debug_open(void){
 }
 
 void debug_create(lv_obj_t *root){
-    g_title = lv_label_create(root);
-    lv_obj_set_style_text_font(g_title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(g_title, lv_color_hex(0xFFFFFF), 0);
-    lv_label_set_text(g_title, "Debug Mode");
-    lv_obj_align(g_title, LV_ALIGN_TOP_MID, 0, 44);
+    ui_header(root, "Debug Mode");   /* shared header: gives Debug Mode the standard back chevron so it
+                                      * isn't a dead-end for users who don't know the edge-swipe gesture */
 
     /* The ssh command + password are what you read off the screen and type, so they get the HIGHEST
      * contrast (bright white); the password also gets the accent colour + bigger font to stand out. */

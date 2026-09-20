@@ -36,8 +36,29 @@ def _save_stock(stock_sq, rep):
     else:
         src = stock_sq
     digest = state.save_stock_image(src, progress=lambda r, t: rep.progress(r, t))
-    rep.ok(f"bone-stock image saved (sha256={digest[:16]}…)")
+    rep.ok(f"bone-stock image saved (sha256={digest[:16]}...)")
     return digest
+
+
+def _ensure_full_size(image_path, rep):
+    """Repad a saved stock image that is SHORTER than IMG_SIZE up to IMG_SIZE with zero padding (the same
+    convention _save_stock and validate_stock_rootfs use), so the 768-block writer covers the whole image.
+    Fixes old 580-block/76 MB backups that would otherwise fail the exact-size preflight (E121). A backup
+    LARGER than IMG_SIZE is real corruption - reject rather than truncate (truncation could hide it)."""
+    sz = os.path.getsize(image_path)
+    if sz == imagebuild.IMG_SIZE:
+        return image_path
+    if sz > imagebuild.IMG_SIZE:
+        raise flasher.FlashError(
+            f"saved stock image is {sz} bytes > {imagebuild.IMG_SIZE} - refusing (truncating it could "
+            "hide a corrupt image)", code="E142",
+            action="delete the saved image and rebuild it from FiiO's firmware .zip")
+    padded = image_path + ".restorepad"   # next to the saved backup (an existing state dir)
+    imagebuild._copyfile(image_path, padded)
+    with open(padded, "r+b") as f:
+        f.truncate(imagebuild.IMG_SIZE)   # zero-fills the tail to the partition size
+    rep.log(f"repadded saved stock image {sz} -> {imagebuild.IMG_SIZE} bytes for the 768-block writer")
+    return padded
 
 
 def _save_state_soft(st, rep):
@@ -87,7 +108,7 @@ def do_install(params, rep, confirm):
         "action": "install",
         "variant": variant,
         "image": out_bin,
-        "duration": "~60-90 minutes",
+        "duration": "~15 minutes",
         "consequence": "This rewrites the device root filesystem. Do not disconnect.",
     }
     if not confirm(summary):
@@ -121,6 +142,11 @@ def do_restore(params, rep, confirm):
         imagebuild.validate_stock_rootfs(stock_sq, rep)
         _save_stock(stock_sq, rep)
 
+    # An OLD saved backup (from a prior installer that built 580-block/76 MB images) can be smaller than
+    # IMG_SIZE; the 768-block writer needs the full partition-size image, so repad a short one before the
+    # exact-size preflight (E121) would otherwise strand it. Then validate + preflight the image that is
+    # ACTUALLY written.
+    stock_bin = _ensure_full_size(stock_bin, rep)
     # Never restore-flash an unvalidated image: validate whatever is about to be written (the saved
     # copy or the freshly-extracted one) - product/version/known-good-hash, not just size+magic.
     imagebuild.validate_stock_rootfs(stock_bin, rep)
@@ -128,7 +154,7 @@ def do_restore(params, rep, confirm):
     summary = {
         "action": "restore-stock",
         "image": stock_bin,
-        "duration": "~60-90 minutes",
+        "duration": "~15 minutes",
         "consequence": "This reflashes bone-stock and removes diskOS. Do not disconnect.",
     }
     if not confirm(summary):

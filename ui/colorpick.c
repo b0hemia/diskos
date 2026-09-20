@@ -82,6 +82,7 @@ void colorpick_open(void){
 static lv_obj_t *mk_slider(lv_obj_t *root, int y, int max){
     lv_obj_t *sl = lv_slider_create(root);
     lv_obj_set_pos(sl, 56, y); lv_obj_set_size(sl, 248, 12);
+    lv_obj_set_ext_click_area(sl, 16);   /* 12px slider -> ~44px grab band on the capacitive panel */
     lv_slider_set_range(sl, 0, max);
     lv_obj_set_style_bg_color(sl, lv_color_hex(0x2C2C2E), LV_PART_MAIN);
     lv_obj_set_style_bg_color(sl, lv_color_hex(0x8E8E93), LV_PART_INDICATOR);

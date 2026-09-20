@@ -5,13 +5,14 @@
 #include "lvgl/lvgl.h"
 #include "ipc.h"
 #include <stdbool.h>
-enum { SCR_HOME, SCR_LIBRARY, SCR_NOWPLAYING, SCR_SETTINGS, SCR_SETTING_DETAIL, SCR_SEARCH, SCR_SAVER, SCR_QUICK, SCR_SONGINFO, SCR_NPMENU, SCR_TUNE, SCR_EQ, SCR_APPS, SCR_NPHUB, SCR_PLPICK, SCR_PLVIEW, SCR_WIFI, SCR_WIFI_INFO, SCR_BT, SCR_BT_INFO, SCR_WEATHER, SCR_LYRICS, SCR_COLORPICK, SCR_LASTFM, SCR_WORKMODE, SCR_DEBUG, SCR_COUNT };
+enum { SCR_HOME, SCR_LIBRARY, SCR_NOWPLAYING, SCR_SETTINGS, SCR_SETTING_DETAIL, SCR_SEARCH, SCR_SAVER, SCR_QUICK, SCR_SONGINFO, SCR_NPMENU, SCR_TUNE, SCR_EQ, SCR_APPS, SCR_NPHUB, SCR_PLPICK, SCR_PLVIEW, SCR_WIFI, SCR_WIFI_INFO, SCR_BT, SCR_BT_INFO, SCR_WEATHER, SCR_LYRICS, SCR_COLORPICK, SCR_LASTFM, SCR_WORKMODE, SCR_DEBUG, SCR_FOLDER, SCR_BOOKS, SCR_CHAPTERS, SCR_SETLIST, SCR_QSCONFIG, SCR_ALBUMWALL, SCR_COUNT };
 void screens_init(void);
 void screen_show(int which);
 void screen_back(void);
 void screen_set_anim(int on);
 int  screen_current(void);
 void ui_toast(const char *msg);   /* transient completion-feedback message */
+void ui_status_refresh(void);     /* re-poll the home status row (battery/wifi/bt) now, e.g. after a radio toggle */
 lv_obj_t *screen_get_root(int which);
 /* screensaver (saver.c) */
 void saver_create(lv_obj_t *root);
@@ -21,6 +22,9 @@ void saver_set_track(const char *title, const char *artist, const void *backdrop
 const char *ui_current_backdrop_src(void);
 /* quick settings (quicksettings.c) */
 void quicksettings_create(lv_obj_t *root);
+void quicksettings_build(void);            /* rebuild the drawer from config (called on every open) */
+void qsconfig_create(lv_obj_t *root);      /* SCR_QSCONFIG: pick which drawer tiles appear */
+void qsconfig_refresh(void);
 void quicksettings_refresh(int playing);
 /* song info (songinfo.c) */
 void songinfo_create(lv_obj_t *root);
@@ -28,6 +32,8 @@ void songinfo_set(const track_state_t *st);
 /* Now Playing side menus (npmenus.c) + custom EQ (eqcustom.c) */
 void npmenu_create(lv_obj_t *root);
 void nphub_create(lv_obj_t *root);   /* right-swipe hub: Playback + Options buttons */
+void nphub_refresh(void);            /* rebuild the hub for the current track (book-aware) */
+void chapters_open(void);            /* load the current book's chapters + show SCR_CHAPTERS (books.c) */
 void tune_create(lv_obj_t *root);
 void eqcustom_create(lv_obj_t *root);
 void colorpick_create(lv_obj_t *root);    /* accent colour picker screen */
@@ -37,6 +43,7 @@ void modes_open(void);                     /* refresh selection + show SCR_WORKM
 /* source/working mode: 0=Local 1=USB-DAC 2=BT-Receiving 3=USB-Storage */
 int  ui_set_source_mode(int mode);         /* replay the stock V2.28 switch sequence; 0=ok -1=bad arg */
 int  ui_get_source_mode(void);
+int  ui_detect_source_mode(void);          /* M17: the ACTUAL mode from the USB gadget state (0/1/3; BT reads as 0) */
 void npmenu_set(const track_state_t *st, int playing, const void *thumb_src);
 void npmenu_close_transients(void);   /* dismiss lv_layer_top popups on navigation */
 void ui_set_favorite(int on);   /* love/unlove the current song (0104) */
@@ -63,18 +70,36 @@ void wifi_info_open(void);
 void bt_create(lv_obj_t *root);
 void bt_open(void);
 int  bt_toggle(void);          /* Quick Settings tile short-press: flip BT + persist, returns new state */
+int  bt_radio_on(void);        /* cheap actual BT-enabled state (rfkill), for the status icon + QS tile */
 void bt_info_create(lv_obj_t *root);
 void bt_info_open(void);
 void bt_boot_restore(void);   /* at startup: re-enable BT + arm auto-route if it was on */
+void bt_notify_player_restart(void);   /* player restarted: forget stale auto-route so the poll re-routes */
+int  ui_player_settling(void);         /* 1 while the player is still in its post-restart late-init settle window */
 void library_open_album(const char *name);
 void library_open_artist(const char *name);
+void albumwall_create(lv_obj_t *root);     /* SCR_ALBUMWALL: cover-flow album browser */
+void albumwall_refresh(void);              /* rebuilt per entry from the album list */
+void albumwall_prewarm_seed(void);         /* MAIN thread: (re)start the incremental album-cover prewarm enqueue */
+void albumwall_step(int dir);              /* +1 next / -1 prev album (discrete: keys / demo) */
+void albumwall_drag_begin(int px);         /* finger down: start a continuous drag from press x */
+void albumwall_drag(int px);               /* finger move: flow follows the finger 1:1 */
+void albumwall_drag_end(void);             /* finger up: inertial fling + snap to nearest album */
+void albumwall_drag_cancel(void);          /* abandon a drag without a fling (tap path) */
+void albumwall_scroll_rel(float d_alb);    /* rim scroll: nudge the flow by d_alb albums (continuous) */
+void albumwall_settle(void);               /* rim release: snap to the nearest album */
+void albumwall_play(void);                 /* play the centred album (cover tap) */
+void albumwall_open(void);                 /* open the centred album's track list (cover long-press) */
+const lv_font_t *ui_text_font(int px);     /* fallback-chained user-text font (14/16/18/20) */
 /* apps launcher (apps.c) + launch hook (main.c) */
 void apps_create(lv_obj_t *root);
 void apps_reload(void);
 void app_launch(const char *exec);
 /* settings (master list + drill-in detail) */
-void settings_create(lv_obj_t *root);
+void settings_create(lv_obj_t *root);      /* SCR_SETTINGS: the category list (Playback/Audio/...) */
 void settings_refresh_list(void);
+void setlist_create(lv_obj_t *root);       /* SCR_SETLIST: one category's rows (built per entry) */
+void setlist_refresh(void);
 void settings_apply_startup(void);
 
 /* accent plumbing: the live accent + per-screen repaint so no surface shows a stale colour */
@@ -90,6 +115,8 @@ void saver_set_accent(lv_color_t accent);
 void saver_show_sync(void);   /* apply saver-style + accent immediately on saver show */
 int  saver_wants_bright(void);/* 1 = keep full brightness (vinyl art showcase), don't dim */
 int  ui_run_bounded(char *const argv[], int timeout_ms);  /* external cmd as a killable child w/ hard timeout */
+void ui_decode_lock(void);    /* serialize an ffmpeg artwork decode against the other decoders (OOM guard) */
+void ui_decode_unlock(void);
 void tune_refresh(void);      /* re-sync Tune panel Play Mode/EQ labels on show */
 
 /* Audio/DAC cluster: send live command (no-op if value <0 = unmanaged). main.c. */
@@ -110,9 +137,19 @@ void ui_set_brightness(int v);   /* persist + apply */
 int  ui_get_brightness(void);
 void ui_backlight(int v);        /* transient backlight write, no persist */
 void ui_set_sleep_timer(int minutes);   /* 0 = off; pauses playback when it elapses */
+void ui_set_sleep_eoc(long target_ms, const char *path, int at_book_end);  /* pause when THAT book's position reaches target_ms (end of chapter); at_book_end=1 if the target is the file end (last/chapterless chapter) so a rollover can fulfil it */
+void ui_disarm_book_eoc(void);  /* disarm any end-of-chapter sleep; call on explicit track navigation */
+int  ui_book_active(void);      /* 1 if an audiobook is the active playback context (suppress play-mode changes) */
+int  ui_sleep_state(int *secs_left);    /* 0 off, 1 duration (fills secs_left), 2 end-of-chapter */
+void ui_np_close_overlays(void);        /* dismiss the Now Playing sleep-timer popover (on screen change) */
+int  ui_np_overlay_active(void);        /* 1 while the sleep popover is up (suppress ring seek/nav) */
+long ui_smart_rewind_ms(long idle_seconds);  /* how far to back up on resume, by idle time */
+void ui_defer_sleep(void);                    /* hold the sleep pause off briefly after a transport tap */
 void setting_detail_create(lv_obj_t *root);
 void setting_detail_refresh(void);
+void eqcustom_refresh(void);   /* re-resolve the edited USER slot on SCR_EQ entry (display-only) */
 void settings_open_detail(int idx);
+void settings_open_key(const char *key);   /* open a setting detail by cfg key (drawer tiles) */
 /* reusable on-screen keyboard modal (kbinput.c) */
 typedef void (*kbinput_done_cb_t)(const char *text);  /* text=NULL if cancelled/empty */
 void kbinput_open(const char *title, const char *initial, kbinput_done_cb_t cb);
@@ -123,15 +160,22 @@ int  kbinput_active(void);   /* 1 while the modal keyboard is up (suppress gestu
 void search_create(lv_obj_t *root);
 void ui_clock_refresh(void);
 /* IPC decode seams (frames wired in once decoded) */
-void ui_seek_to(long ms);
+int ui_seek_to(long ms);   /* returns 0 if the seek frame was queued, -1 if the send failed */
+void ui_play_book(const char *path, long resume_ms);   /* play an audiobook file + resume at resume_ms (0 = start) */
+void ui_cancel_book_resume(void);                      /* end the book session (call on any explicit track change) */
+void ui_book_user_seeked(long target_ms);              /* manual seek in a book: drop pending resume, persist target_ms to the bookmark now, keep session */
 int  ui_set_volume(int vol);   /* set absolute volume 0..VOL_MAX; returns 0=queued, -1=failed */
 void ui_set_workmode(int mode);
-void ui_apply_eq(int preset);
+int ui_apply_eq(int preset);
+int ui_eq_select(int preset);    /* central EQ apply+persist (eq_preset + eq_last); 0 ok, -1 send failed */
+int ui_is_playing(void);         /* authoritative normalized play state (for the drawer transport glyph) */
+const char *ui_eq_name(int i);   /* EQ preset name for index 0..20 (drawer toast) */
 void ui_rescan_library(void);
 void ui_invalidate_play_scope(void);   /* clear LIST_SONG_0 scope cache after a list-content edit */
 /* play a library list (0100): list_type 0=all,2=artist,3=album,10=genre;
  * name = artist/album/genre (NULL/"" for all); pos1 = 1-based start track. */
 void ui_play_list(int list_type, const char *name, int pos1);
+int  ui_play_song_by_path(const char *path);   /* folder browser: play a track by absolute path (1=ok) */
 void ui_play_playlist(long pid, int pos);
 /* swipe sensitivity (px of horizontal travel needed for a back-swipe); lower = more sensitive */
 void ui_set_swipe_thresh(int px);
@@ -142,6 +186,7 @@ void ui_create(lv_obj_t *root);
 void ui_update(const track_state_t *st);
 void ui_art_poll(lv_timer_t *t);          /* apply a finished album-art decode (main thread) */
 void ui_start_art_prewarm(void);          /* spawn the background cover/accent prewarm sweep */
+int  ui_prewarm_enqueue(const char *path); /* MAIN thread: queue a track path for background cover decode; 1=queued/dup, 0=full */
 void ui_set_accent_config(int mode, int rgb);  /* 0=dynamic / 1=static(rgb); applies immediately */
 int  ui_accent_is_static(void);
 void ui_set_prewarm_mode(int m);          /* 0=off 1=idle 2=charging 3=idle|charging */

@@ -205,7 +205,9 @@ static int program_page(u32 page,u8*src){u32 st; int r;
 #define START_BLOCK 80u     /* rootfs @0xA00000 / 0x20000 */
 #endif
 #ifndef NLOGBLOCKS
-#define NLOGBLOCKS 580u     /* diskos_*_v228.bin = 76021760 B / 128KB = 580 blocks (override via -D) */
+#define NLOGBLOCKS 768u     /* IMG_SIZE 100663296 B / 128KB = 768 blocks (fits v2.40's 88 MB rootfs;
+                              covers v2.09/v2.28 too). MUST match imagebuild IMG_SIZE; the flasher's
+                              writer-capacity check (dbg[6]) enforces it. Override via -D for other sizes. */
 #endif
 #ifndef SKIP_BLOCK
 #define SKIP_BLOCK 383u     /* verified factory bad block in the rootfs region (dump ground truth) */

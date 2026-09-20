@@ -81,14 +81,51 @@ int artcache_get(const char *track, const char *cover_out, const char *thumb_out
     return 0;
 }
 
+int artcache_get_thumb(const char *track, const char *thumb_out){
+    char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return -1;
+    char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
+    if(!file_ok(th)) return -1;          /* thumb not cached (or truncated) */
+    if(copy_file(th,thumb_out)!=0) return -1;
+    return 0;
+}
+
+/* Return the native path of the cached 148px cover for a track (no copy), so a caller can read/decode it
+ * directly (e.g. an off-thread cover loader). Returns 0 + fills out on a cache hit, -1 if not cached. */
+int artcache_cover_path(const char *track, char *out, int cap){
+    char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return -1;
+    char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
+    if(!file_ok(cv)) return -1;
+    snprintf(out, cap, "%s", cv);
+    return 0;
+}
+
+/* Copy JUST the cached 148px cover (no thumb/backdrop) - used by the Album Wall, which only needs the
+ * cover, so it avoids copying the ~360px backdrop every step. Returns 0 on hit, -1 if not cached. */
+int artcache_get_cover(const char *track, const char *cover_out){
+    char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return -1;
+    char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
+    if(!file_ok(cv)) return -1;
+    if(copy_file(cv,cover_out)!=0) return -1;
+    return 0;
+}
+
+/* Monotonic counter bumped whenever a new cover lands in the cache (any decoder: live NP art,
+ * per-track prewarm, or the album prewarm). The cover flow watches it to re-bake placeholders. */
+static _Atomic unsigned g_ac_gen;
+unsigned artcache_gen(void){ return atomic_load(&g_ac_gen); }
+
 void artcache_put(const char *track, const char *cover, const char *thumb, const char *bg){
     char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return;
     if(!enough_free()) return;
+    if(!sd_write_begin()) return;   /* M18: card is host-owned or an export is in progress -> skip the SD write */
     char dir[600];
     mkdir("/tmp/sdcard/.diskos", 0755);   /* ignore EEXIST */
     mkdir(CACHE_ROOT, 0755);
     snprintf(dir,sizeof dir,"%s/%s",CACHE_ROOT,fp);
     mkdir(dir, 0755);
     char cv[600],th[600],bg2[600]; cache_paths(fp,cv,th,bg2,600);
-    copy_file(cover,cv); copy_file(thumb,th); copy_file(bg,bg2);
+    int cover_ok = (copy_file(cover,cv)==0);
+    copy_file(thumb,th); copy_file(bg,bg2);
+    sd_write_end();
+    if(cover_ok) atomic_fetch_add(&g_ac_gen, 1);   /* signal the cover flow that a new cover is available */
 }

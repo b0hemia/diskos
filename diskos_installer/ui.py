@@ -99,7 +99,7 @@ class Bar:
 
 class Heartbeat:
     """Indeterminate progress for a long step with no reliable progress channel
-    (the ~60-90 min mask-ROM flash). Shows elapsed time + a spinner and a fixed
+    (the ~15 min mask-ROM flash). Shows elapsed time + a spinner and a fixed
     'do not disconnect' reminder. Call tick() periodically; stop() to finish."""
 
     FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"

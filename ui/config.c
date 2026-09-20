@@ -8,11 +8,25 @@
 #include <fcntl.h>
 #include <errno.h>
 
+/* Paths are overridable at compile time (-D...) so the off-device host test can point them at a
+ * temp file; the device build uses these defaults. */
+#ifndef CFG_PATH
 #define CFG_PATH     "/usr/data/diskos.conf"
+#endif
+#ifndef CFG_DIR
 #define CFG_DIR      "/usr/data"
+#endif
+#ifndef LEGACY_CONF
 #define LEGACY_CONF  "/usr/data/ipodos.conf"    /* pre-rename config; migrated on first load */
+#endif
+#ifndef LEGACY_SWIPE
 #define LEGACY_SWIPE "/usr/data/swipe_thresh"   /* pre-config single-value file */
-#define CFG_MAX      64
+#endif
+/* Headroom for every key the app can persist: 10 EQ slots x 11 keys (eqN_b0..b9 + eqN_master)
+ * = 110, plus the legacy flat eq_* keys (migrated once), plus ~30 general settings. 64 was far
+ * too small - once g_cfg filled, put() silently dropped new keys AND rewrite() flushed only the
+ * first 64 entries back to diskos.conf, permanently deleting the rest. */
+#define CFG_MAX      256
 #define KLEN         28
 #define VLEN         48
 
@@ -22,6 +36,16 @@ static int g_n = 0;
 static int g_loaded = 0;
 
 static int g_save_err = 0;   /* sticky until cfg_take_save_error() reads it */
+static int g_dirty = 0;      /* the in-memory set differs from the on-disk file: a save is pending
+                              * (a deferred batch) or FAILED. Guards the unchanged-value shortcut so a
+                              * failed persist is retried instead of masked by "value already equals v". */
+
+/* Atomic multi-key batch (e.g. Last.fm credentials): cfg_begin() snapshots the whole store, deferred
+ * sets mutate it, cfg_commit() rewrites ONLY if every set succeeded, else it rolls the store back to
+ * the snapshot and reports failure - so a partial credentials write is impossible even if the store
+ * fills or a value is rejected mid-batch. */
+static cfg_entry_t g_snap[CFG_MAX];
+static int g_snap_n = 0, g_snap_dirty = 0, g_txn = 0, g_txn_err = 0;
 static int g_load_failed = 0;   /* cfg_load hit a transient open/read error (NOT genuine first-run):
                                  * the in-memory set is empty/partial, so rewrite() must REFUSE to run -
                                  * else a single boot-time read glitch would overwrite a good diskos.conf
@@ -54,19 +78,53 @@ static int rewrite(void){
     if(dfd < 0){ g_save_err = 1; return -1; }
     int dr = fsync(dfd);
     if(close(dfd) != 0 || dr != 0){ g_save_err = 1; return -1; }
+    g_dirty = 0;   /* the on-disk file now equals the in-memory set */
     return 0;
 }
 
 int cfg_take_save_error(void){ int e = g_save_err; g_save_err = 0; return e; }
 
-static void put(const char *key, const char *val){
+/* Returns 0 on success, -1 if the key/value is too long or the store is full. Rejects WITHOUT
+ * mutating, so a bad set never half-writes an entry (was: silently dropped/truncated). Marks g_dirty
+ * only when it actually changes a stored value. */
+static int put(const char *key, const char *val){
+    if(strlen(key) >= KLEN || strlen(val) >= VLEN){ if(g_txn) g_txn_err = 1; return -1; }  /* too long -> reject, no mutation */
     cfg_entry_t *e = find(key);
+    int isnew = 0;
     if(!e){
-        if(g_n >= CFG_MAX) return;
+        if(g_n >= CFG_MAX){ if(g_txn) g_txn_err = 1; return -1; }   /* store full -> reject */
         e = &g_cfg[g_n++];
+        e->k[0] = 0; e->v[0] = 0;
         snprintf(e->k, KLEN, "%s", key);
+        isnew = 1;
     }
-    snprintf(e->v, VLEN, "%s", val);
+    /* a NEW key is always a change - even value "" - so it must mark dirty (else adding an empty key
+     * would stay "clean" and never persist). */
+    if(isnew || strcmp(e->v, val) != 0){ snprintf(e->v, VLEN, "%s", val); g_dirty = 1; }
+    return 0;
+}
+
+/* Parse "key=value\n" lines from f into the store. Returns 0 clean, -1 if the load is INCOMPLETE (an I/O
+ * error, or the store filled up) so the caller can block rewrites and not persist a partial config over a
+ * good file. An OVERLONG physical line (longer than the buffer - never produced by our KLEN/VLEN-bounded
+ * writer) is DRAINED and skipped, so its tail can't be misparsed as a separate (corrupt) setting. */
+static int cfg_parse_stream(FILE *f){
+    char line[KLEN+VLEN+4];
+    int failed = 0;
+    while(fgets(line, sizeof(line), f)){
+        size_t ll = strlen(line);
+        int has_nl = (ll && line[ll-1]=='\n');
+        if(!has_nl && ll == sizeof(line)-1){          /* buffer full, no newline -> overlong line: drain + skip */
+            int c; while((c=fgetc(f))!=EOF && c!='\n'){}
+            continue;
+        }
+        if(has_nl) line[ll-1] = 0;
+        char *eq = strchr(line, '='); if(!eq) continue;
+        *eq = 0;
+        if(line[0] && put(line, eq+1) < 0) failed = 1; /* store capacity full -> incomplete load */
+    }
+    if(ferror(f)) failed = 1;                          /* mid-read I/O error -> incomplete load */
+    return failed ? -1 : 0;
 }
 
 void cfg_load(void){
@@ -74,17 +132,9 @@ void cfg_load(void){
     g_loaded = 1;
     FILE *f = fopen(CFG_PATH, "r");
     if(f){
-        char line[KLEN+VLEN+4];
-        while(fgets(line, sizeof(line), f)){
-            char *nl = strchr(line, '\n'); if(nl) *nl = 0;
-            char *eq = strchr(line, '=');
-            if(!eq) continue;
-            *eq = 0;
-            if(line[0]) put(line, eq+1);
-        }
-        if(ferror(f)) g_load_failed = 1;   /* a mid-read I/O error -> partial load; block rewrites so we
-                                            * don't persist a truncated config over the good on-disk one */
+        if(cfg_parse_stream(f) < 0) g_load_failed = 1; /* incomplete (I/O error or store full) -> block rewrites */
         fclose(f);
+        g_dirty = 0;   /* the in-memory set now equals the on-disk file (loading isn't a pending save) */
         return;
     }
     if(errno != ENOENT){   /* open failed for a TRANSIENT reason (EIO/EACCES/EMFILE), not "file absent":
@@ -97,18 +147,16 @@ void cfg_load(void){
      * persists to the new diskos.conf (the old file is left in place, harmless). */
     FILE *lc = fopen(LEGACY_CONF, "r");
     if(lc){
-        char line[KLEN+VLEN+4];
-        while(fgets(line, sizeof(line), lc)){
-            char *nl = strchr(line, '\n'); if(nl) *nl = 0;
-            char *eq = strchr(line, '=');
-            if(!eq) continue;
-            *eq = 0;
-            if(line[0]) put(line, eq+1);
-        }
-        int bad = ferror(lc);
+        int bad = (cfg_parse_stream(lc) < 0);
         fclose(lc);
         if(!bad) rewrite();   /* write the migrated set to diskos.conf */
         else g_load_failed = 1;
+        return;
+    }
+    if(errno != ENOENT){   /* legacy open failed for a TRANSIENT reason (EIO/EMFILE/EACCES), not "absent":
+                            * don't treat as first-run + create a fresh defaults-only config that would
+                            * permanently bypass migration. Mark failed so a later boot retries. */
+        g_load_failed = 1;
         return;
     }
     /* genuine first run (ENOENT): import legacy single-value swipe_thresh file if present */
@@ -131,9 +179,12 @@ int cfg_get_int(const char *key, int def){
 int cfg_set_int(const char *key, int v){
     if(g_load_failed){ g_save_err = 1; return -1; }   /* load failed -> fully read-only, no memory mutation */
     cfg_entry_t *e = find(key);
-    if(e && atoi(e->v) == v) return 0;   /* unchanged: skip the flash rewrite */
+    if(e && atoi(e->v) == v && !g_dirty) return 0;   /* unchanged AND fully persisted -> nothing to do.
+                                                      * Must NOT skip when g_dirty: a prior save failed, or
+                                                      * a deferred batch is pending, so re-setting the same
+                                                      * value still has to flush it to disk (retries the save). */
     char b[16]; snprintf(b,sizeof(b),"%d",v);
-    put(key, b);
+    if(put(key, b) < 0){ g_save_err = 1; return -1; }   /* too long / store full -> report, don't persist a bad set */
     return rewrite();
 }
 /* Batched set: update the in-memory value only, NO flash write. Follow a run of these
@@ -144,10 +195,26 @@ int cfg_set_int_deferred(const char *key, int v){
     cfg_entry_t *e = find(key);
     if(e && atoi(e->v) == v) return 0;
     char b[16]; snprintf(b,sizeof(b),"%d",v);
-    put(key, b);
+    if(put(key, b) < 0){ g_save_err = 1; return -1; }
     return 0;
 }
 int cfg_flush(void){ return rewrite(); }
+
+void cfg_begin(void){
+    if(g_load_failed){ g_save_err = 1; return; }
+    if(g_n > 0) memcpy(g_snap, g_cfg, (size_t)g_n * sizeof g_cfg[0]);
+    g_snap_n = g_n; g_snap_dirty = g_dirty; g_txn = 1; g_txn_err = 0;
+}
+int cfg_commit(void){
+    if(!g_txn) return cfg_flush();          /* no open batch -> behave like a plain flush */
+    g_txn = 0;
+    if(g_txn_err){                          /* a set failed mid-batch -> roll the WHOLE store back to the snapshot */
+        if(g_snap_n > 0) memcpy(g_cfg, g_snap, (size_t)g_snap_n * sizeof g_cfg[0]);
+        g_n = g_snap_n; g_dirty = g_snap_dirty; g_save_err = 1;
+        return -1;
+    }
+    return rewrite();
+}
 
 const char *cfg_get_str(const char *key, const char *def){
     cfg_entry_t *e = find(key);
@@ -156,6 +223,14 @@ const char *cfg_get_str(const char *key, const char *def){
 
 int cfg_set_str(const char *key, const char *v){
     if(g_load_failed){ g_save_err = 1; return -1; }   /* load failed -> read-only */
-    put(key, v);
+    if(put(key, v) < 0){ g_save_err = 1; return -1; }
     return rewrite();
+}
+/* in-memory only; follow a run with cfg_flush() so multi-key writes (e.g. Last.fm api_key + secret
+ * + session key) persist in ONE atomic rewrite - a partial credentials write on a mid-run failure
+ * is then impossible. */
+int cfg_set_str_deferred(const char *key, const char *v){
+    if(g_load_failed){ g_save_err = 1; return -1; }
+    if(put(key, v) < 0){ g_save_err = 1; return -1; }
+    return 0;
 }

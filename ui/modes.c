@@ -20,8 +20,7 @@ static const modeinfo_t MODES[] = {
 static lv_obj_t *g_check[N_MODES];   /* per-row checkmark label */
 static lv_obj_t *g_row[N_MODES];     /* per-row button (for the selected highlight) */
 
-static void mark_selected(void){
-    int cur = ui_get_source_mode();
+static void mark_selected_mode(int cur){
     for(int i=0;i<N_MODES;i++){
         if(g_check[i]){ lv_label_set_text(g_check[i], i==cur ? LV_SYMBOL_OK : "");
                         lv_obj_set_style_text_color(g_check[i], ui_current_accent(), 0); }  /* track accent changes */
@@ -32,9 +31,46 @@ static void mark_selected(void){
         }
     }
 }
+static void mark_selected(void){ mark_selected_mode(ui_get_source_mode()); }
 
 
 static uint32_t g_last_switch = 0;   /* debounce: a switch takes a few seconds to apply in the player */
+
+/* Pending state: the tapped row shows a "switching" glyph (not the confirmed checkmark) while the
+ * gadget switch is in flight - there is no source-mode completion readback, so after the switch
+ * window we settle to the selection best-effort (matches the honest "Switching..." toast). */
+static void mark_pending(int m){
+    for(int i=0;i<N_MODES;i++){
+        if(g_check[i]){ lv_label_set_text(g_check[i], i==m ? LV_SYMBOL_REFRESH : "");
+                        lv_obj_set_style_text_color(g_check[i], ui_current_accent(), 0); }
+        if(g_row[i]){   /* highlight the row being switched to */
+            lv_obj_set_style_border_width(g_row[i], i==m ? 2 : 0, 0);
+            lv_obj_set_style_border_color(g_row[i], ui_current_accent(), 0);
+            lv_obj_set_style_bg_color(g_row[i], lv_color_hex(i==m ? 0x242426 : 0x1C1C1E), 0);
+        }
+    }
+}
+
+static lv_timer_t *g_settle = NULL;
+static int g_pending_mode = -1;   /* the mode a switch is settling to (so reopening the screen keeps showing "switching") */
+/* M17: after the switch window, settle to the CONFIRMED mode read from the real USB gadget state,
+ * not a blind assumption. If the gadget shows the switch didn't take, reflect reality + say so. */
+static void settle_cb(lv_timer_t *t){
+    (void)t; lv_timer_del(g_settle); g_settle = NULL;
+    int intended = g_pending_mode; g_pending_mode = -1;
+    /* M17: DISPLAY the ACTUAL gadget state (read-only) instead of a blind timer assumption. Do NOT
+     * mutate the intent mirror (g_source_mode) - it also guards coldplug, and a transient mid-transition
+     * sample must not flip that guard. */
+    int show = (intended >= 0) ? intended : ui_get_source_mode();
+    if(intended == 0 || intended == 1 || intended == 3){   /* USB gadget modes are readback-confirmable */
+        int actual = ui_detect_source_mode();
+        show = actual;
+        if(actual != intended) ui_toast("Mode didn't switch");
+    }
+    /* intended == 2 (BT receiving) is gadget-invisible and needs a phone to connect - no reliable
+     * readback here, so show the intent without asserting a false confirmation. */
+    mark_selected_mode(show);
+}
 
 static void row_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
@@ -42,22 +78,28 @@ static void row_cb(lv_event_t *e){
     /* Serialise: ignore taps while the previous switch is still applying (the player's gadget
      * state-machine is asynchronous). NB we do NOT early-return on "same mode" - re-issuing must
      * always be allowed so Local works as a recover even if our cached mode is stale. */
-    if(g_last_switch && lv_tick_elaps(g_last_switch) < 3000){ ui_toast("Switching\xE2\x80\xA6"); return; }
+    if(g_last_switch && lv_tick_elaps(g_last_switch) < 3000){ ui_toast("Switching..."); return; }
     g_last_switch = lv_tick_get();
     if(ui_set_source_mode(m) == 0){
-        mark_selected();
+        g_pending_mode = m;
+        mark_pending(m);      /* async switch in flight: show "switching", not a confirmed selection */
+        if(g_settle) lv_timer_del(g_settle);
+        g_settle = lv_timer_create(settle_cb, 3200, NULL);   /* settle to the checkmark after the switch window */
         /* honest wording: the frames are queued; the async switch completes a moment later. */
         static const char *msg[N_MODES] = {
             "Switching to local playback", "Switching to USB DAC",
-            "Bluetooth receiving on \xE2\x80\x93 connect your phone",
-            "USB storage on \xE2\x80\x93 connect a computer" };
+            "Switching to Bluetooth receiving", "Switching to USB storage" };
         ui_toast(msg[m]);
     } else {
         ui_toast("Couldn't switch mode");
     }
 }
 
-void modes_open(void){ mark_selected(); screen_show(SCR_WORKMODE); }
+void modes_open(void){
+    if(g_settle && g_pending_mode >= 0) mark_pending(g_pending_mode);  /* a switch is still settling - keep showing it */
+    else mark_selected();
+    screen_show(SCR_WORKMODE);
+}
 
 void modes_create(lv_obj_t *root){
     lv_obj_set_style_bg_color(root, lv_color_hex(0x000000), 0);
@@ -70,6 +112,7 @@ void modes_create(lv_obj_t *root){
     lv_obj_t *col = lv_obj_create(root);
     lv_obj_remove_style_all(col);
     lv_obj_set_size(col, 300, 250); lv_obj_set_pos(col, 30, 76);
+    lv_obj_set_style_pad_bottom(col, 44, 0);   /* last mode row scrolls clear of the round bezel */
     lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
     lv_obj_set_style_pad_row(col, 8, 0);

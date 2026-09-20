@@ -19,8 +19,10 @@ rules keep contributions safe and legally clean.
 
 ## Licensing and provenance
 
-- Original diskOS files are MIT. By contributing you agree your contribution is under the same
-  license. Please sign off your commits (`git commit -s`, Developer Certificate of Origin).
+- diskOS has two licenses by area: the on-device UI source in [`ui/`](ui/) is **GPL-3.0-or-later**;
+  the installer and build tooling (everything else) is **MIT**. By contributing you agree your
+  contribution is under the license that already governs the file(s) you change. Please sign off your
+  commits (`git commit -s`, Developer Certificate of Origin).
 - **Do not upload FiiO firmware, stock rootfs images, or generated `diskos_*.bin` images** to issues
   or PRs - they contain FiiO's software. The installer builds images locally from a user's own
   firmware; that is fine, redistributing them is not.

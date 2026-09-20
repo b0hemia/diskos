@@ -138,6 +138,7 @@ void lastfm_create(lv_obj_t *root){
     g_body = lv_obj_create(root);
     lv_obj_remove_style_all(g_body);
     lv_obj_set_size(g_body, 300, 250);
+    lv_obj_set_style_pad_bottom(g_body, 44, 0);   /* last row scrolls clear of the round bezel */
     lv_obj_align(g_body, LV_ALIGN_TOP_MID, 0, 74);
     lv_obj_set_flex_flow(g_body, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_body, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);

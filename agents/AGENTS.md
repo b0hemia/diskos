@@ -1,10 +1,9 @@
 # diskOS - working rules for AI coding agents
 
-This file is written for an AI coding agent (Claude Code, Codex, or similar) helping someone
-hack on **diskOS** - a custom UI/firmware for the FiiO Snowsky Disc digital audio player
-(Ingenic X2000 SoC). Drop it in as your `CLAUDE.md` or `AGENTS.md`, or paste it into the
-session, and follow it. It encodes the discipline that keeps this project honest and the
-device un-bricked.
+This file is written for an AI coding agent helping someone hack on **diskOS** - a custom
+UI/firmware for the FiiO Snowsky Disc digital audio player (Ingenic X2000 SoC). Drop it in as your
+agent's project-instruction file (the `AGENTS.md` convention), or paste it into the session, and
+follow it. It encodes the discipline that keeps this project honest and the device un-bricked.
 
 ## The one rule that matters most: verify, do not guess
 

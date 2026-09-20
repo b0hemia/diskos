@@ -50,8 +50,8 @@ the boundary.
 | **Project status** | Beta; field testing is still limited |
 | **Released host** | Linux x86-64 |
 | **macOS** | Build path exists; artifact and device flash are unverified |
-| **Flash-tested stock firmware** | V2.09 and V2.28 |
-| **Typical flash time** | 60-90 minutes, including verification |
+| **Flash-tested stock firmware** | V2.09, V2.28, and V2.40 |
+| **Typical flash time** | about 15 minutes, including verification |
 | **Return to stock** | Saved-image restore, temporary stock boot, or stock UI as default |
 
 Not affiliated with or endorsed by FiiO, Snowsky, or Ingenic. No warranty or support is promised.
@@ -127,7 +127,7 @@ After setup, run commands through `./diskos-installer`; it selects the local env
 3. Power the Disc off. Hold **Volume Down** and plug in USB to enter mask-ROM mode. The screen stays
    black; that is expected.
 4. Select **Install**, acknowledge the warning, and begin. Do not disconnect the cable or let the
-   host sleep during the 60-90 minute flash.
+   host sleep during the roughly 15-minute flash.
 5. After verification succeeds, power-cycle the device. diskOS is embedded in the flashed image and
    installs on first boot; no microSD installation step is needed.
 
@@ -151,7 +151,7 @@ Useful recovery and cleanup commands:
 - A **FiiO Snowsky Disc** with supported stock firmware.
 - The matching official FiiO firmware `.zip`. You supply this file; the installer decrypts and
   extracts its root filesystem locally.
-- A reliable USB cable and 60-90 uninterrupted minutes.
+- A reliable USB cable and about 15 uninterrupted minutes.
 - **Python 3.8+** and the dependencies installed by `./install.sh`.
 - USB access to mask-ROM device `a108:eaef`.
 - **Linux x86-64** for the released path. macOS support remains unverified.
@@ -172,7 +172,12 @@ The build, save, and flash then run as one unprivileged process.
 - **Linux x86-64:** released and tested end to end.
 - **macOS, Apple Silicon and Intel:** source is macOS-aware, but there is no verified release
   artifact yet. Build on a Mac with `build/build-macos.sh` after installing libusb with Homebrew.
-  Treat the entire path as unverified until a real-device flash succeeds.
+  Run it from a **case-sensitive volume.** macOS is case-insensitive by default, and the stock
+  firmware contains files that differ only in case, so extracting it on a case-insensitive
+  filesystem can silently corrupt the built image. Point `DISKOS_INSTALLER_HOME` at a
+  case-sensitive volume (create one in Disk Utility, or a case-sensitive APFS sparse image),
+  since the build and extraction use that workspace. Treat the entire path as unverified until a
+  real-device flash succeeds.
 
 ## Restore stock & recover
 
@@ -198,7 +203,7 @@ flashed code runs, but recovery is still **not guaranteed** for every unit or fa
 | ✅ | Firmware extraction | Reproduces the stock root filesystem byte for byte from FiiO's archive |
 | ✅ | Linux x86-64 | Builds and flashes end to end |
 | ⚠️ | macOS | Build recipe exists; artifact and real-device flash are unverified |
-| ⚠️ | Firmware coverage | V2.09 and V2.28 are flash-tested; other versions are refused by default |
+| ⚠️ | Firmware coverage | V2.09, V2.28, and V2.40 are flash-tested; other versions are refused by default |
 
 The Disc uses **Winbond W63AH6NKB LPDDR3**, the DRAM initialized by its stock bootloader. If a future
 hardware revision uses different DRAM, the writer is designed to fail at memory initialization and
@@ -206,9 +211,9 @@ leave the device mask-ROM-recoverable instead of continuing. Wide field testing 
 
 ## Known issues
 
-- **Firmware coverage:** only V2.09 and V2.28 are currently flash-tested. Other command maps can
+- **Firmware coverage:** only V2.09, V2.28, and V2.40 are currently flash-tested. Other command maps can
   differ and are refused by default.
-- **Long flash:** a complete write and verification takes about 60-90 minutes. Most of the time is
+- **Long flash:** a complete write and verification takes about 15 minutes. Most of the time is
   a conservative fixed wait; a faster writer is planned.
 - **No on-device update path:** updating diskOS currently requires another flash.
 - **microSD after cold boot:** the card mounts a few seconds after startup. If the library initially

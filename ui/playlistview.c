@@ -18,7 +18,11 @@ static lv_obj_t *g_title_lbl, *g_song_list;
 static lv_obj_t *g_play_btn, *g_shuffle_btn;   /* dimmed + non-clickable when the playlist is empty */
 static lv_obj_t *g_menu, *g_dialog;   /* transient popups on lv_layer_top */
 
-static void close_pop(lv_obj_t **p){ if(*p){ lv_obj_del(*p); *p = NULL; } }
+/* Deletes async: callers run inside LV_EVENT_CLICKED handlers on descendants of *p, so a
+ * synchronous lv_obj_del here would free the very button whose click is still being
+ * dispatched (UAF once the event returns). *p is cleared immediately so no path can
+ * double-close while the async delete is pending. */
+static void close_pop(lv_obj_t **p){ if(*p){ lv_obj_delete_async(*p); *p = NULL; } }
 
 /* Enable/disable the transport buttons for an empty playlist: at 0 songs Play/Shuffle would only
  * toast, so dim them and drop CLICKABLE to signal there's nothing to play. */
@@ -33,8 +37,21 @@ static void pl_set_transport_enabled(int on){
 }
 
 /* ---- song list ---------------------------------------------------------- */
+static void plv_reload(void);   /* fwd */
+/* Long-press a song row -> remove it from the playlist (L32). Uses the 1-based display ordinal
+ * bound to the row, matching mdb_playlist_songs()'s order. */
+static void plv_remove_cb(lv_event_t *e){
+    if(lv_event_get_code(e)!=LV_EVENT_LONG_PRESSED) return;
+    int pos = (int)(intptr_t)lv_event_get_user_data(e);
+    if(mdb_playlist_remove_at(g_pid, pos)){
+        ui_toast("Removed from playlist");
+        ui_invalidate_play_scope();   /* the ordered list the player may hold just changed */
+        plv_reload();                 /* rebuild so ordinals stay correct */
+        library_refresh();            /* playlist row count / Now-Playing add-state */
+    }
+}
 static void plv_song_cb(lv_event_t *e){
-    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    if(lv_event_get_code(e)!=LV_EVENT_SHORT_CLICKED) return;   /* SHORT_CLICKED so a long-press-to-remove never also plays */
     int pos = (int)(intptr_t)lv_event_get_user_data(e);   /* 1-based */
     ui_play_playlist(g_pid, pos);
     screen_show(SCR_NOWPLAYING);
@@ -49,6 +66,10 @@ static void plv_reload(void){
     mdb_song_t *songs = (cnt>0 && (size_t)cnt <= ((size_t)-1) / sizeof(mdb_song_t))   /* 32-bit overflow guard */
                         ? malloc((size_t)cnt*sizeof(mdb_song_t)) : NULL;
     int n = songs ? mdb_playlist_songs(g_pid, songs, cnt) : 0;
+    /* Cap RENDERED rows well under LVGL's uint16 child count (65535, where child_cnt wraps and corrupts the
+     * child array). 8192 is far above any realistic playlist yet memory-safe; a pathological larger playlist
+     * simply shows its first 8192. (Playback still uses the full playlist via id+position replay.) */
+    if(n > 8192) n = 8192;
     pl_set_transport_enabled(n > 0);
     if(n<=0){
         free(songs);   /* NULL-safe */
@@ -67,7 +88,8 @@ static void plv_reload(void){
         lv_obj_set_style_bg_color(r, lv_color_hex(0x1C1C1E), LV_STATE_PRESSED);
         lv_obj_set_style_bg_opa(r, LV_OPA_70, LV_STATE_PRESSED);
         lv_obj_clear_flag(r, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_event_cb(r, plv_song_cb, LV_EVENT_CLICKED, (void*)(intptr_t)(i+1));
+        lv_obj_add_event_cb(r, plv_song_cb, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)(i+1));
+        lv_obj_add_event_cb(r, plv_remove_cb, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)(i+1));  /* L32: hold to remove */
         lv_obj_t *t = lv_label_create(r);
         lv_label_set_text(t, songs[i].title);
         lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
@@ -82,6 +104,7 @@ static void plv_reload(void){
         lv_obj_set_style_text_color(a, lv_color_hex(0xC7C7CC), 0);
     }
     free(songs);
+    { static int hinted = 0; if(!hinted){ hinted = 1; ui_toast("Hold a song to remove it"); } }  /* L32 discoverability, once/run */
 }
 /* Public: rebuild the list from the DB. Called by the screen manager on EVERY entry
  * to SCR_PLVIEW (incl. back-nav), so tap positions can't go stale after the playlist's
@@ -157,6 +180,7 @@ static lv_obj_t *card_btn(lv_obj_t *p, int y, int w, const char *txt, lv_color_t
     lv_obj_t *b = lv_button_create(p);
     lv_obj_remove_style_all(b);
     lv_obj_set_size(b, w, 40);
+    lv_obj_set_ext_click_area(b, 4);   /* 40px pill -> ~48px touch target on the capacitive panel */
     lv_obj_align(b, LV_ALIGN_TOP_MID, 0, y);
     lv_obj_set_style_radius(b, 12, 0);
     lv_obj_set_style_bg_color(b, bg, 0);
@@ -207,6 +231,15 @@ static void rename_cb(lv_event_t *e){
 /* ---- 3-dot menu --------------------------------------------------------- */
 static void menu_dismiss_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) close_pop(&g_menu); }
 static void del_menu_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) show_delete_confirm(); }
+static void export_cb(lv_event_t *e){   /* L37: write the playlist to /tmp/sdcard/<name>.m3u */
+    if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
+    close_pop(&g_menu);
+    char fn[112];
+    if(mdb_playlist_export(g_pid, g_name, fn, sizeof fn)){
+        char msg[160]; snprintf(msg, sizeof msg, "Exported to %s", fn);
+        ui_toast(msg);
+    } else ui_toast("Export failed - SD not available");
+}
 static void open_menu_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
     close_pop(&g_menu);
@@ -221,14 +254,15 @@ static void open_menu_cb(lv_event_t *e){
     lv_obj_add_event_cb(g_menu, menu_dismiss_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *c = lv_obj_create(g_menu);
     lv_obj_remove_style_all(c);
-    lv_obj_set_size(c, 240, 124);
+    lv_obj_set_size(c, 240, 176);
     lv_obj_center(c);
     lv_obj_set_style_radius(c, 16, 0);
     lv_obj_set_style_bg_color(c, lv_color_hex(0x1C1C1E), 0);
     lv_obj_set_style_bg_opa(c, LV_OPA_COVER, 0);
     lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
-    card_btn(c, 12, 216, "Edit Name",       lv_color_hex(0x2C2C2E), lv_color_hex(0xFFFFFF), rename_cb);
-    card_btn(c, 64, 216, "Delete Playlist", lv_color_hex(0x2C2C2E), lv_color_hex(0xFF453A), del_menu_cb);
+    card_btn(c, 12,  216, "Edit Name",       lv_color_hex(0x2C2C2E), lv_color_hex(0xFFFFFF), rename_cb);
+    card_btn(c, 64,  216, "Export to SD",    lv_color_hex(0x2C2C2E), lv_color_hex(0x0A84FF), export_cb);
+    card_btn(c, 116, 216, "Delete Playlist", lv_color_hex(0x2C2C2E), lv_color_hex(0xFF453A), del_menu_cb);
 }
 
 static void back_cb(lv_event_t *e){ if(lv_event_get_code(e)==LV_EVENT_CLICKED) screen_back(); }
@@ -281,6 +315,7 @@ void plview_create(lv_obj_t *root){
     lv_obj_remove_style_all(g_song_list);
     lv_obj_set_pos(g_song_list, 40, 118);
     lv_obj_set_size(g_song_list, 290, 226);
+    lv_obj_set_style_pad_bottom(g_song_list, 44, 0);   /* last row scrolls clear of the round bottom bezel */
     lv_obj_set_style_bg_opa(g_song_list, LV_OPA_TRANSP, 0);
     lv_obj_set_flex_flow(g_song_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(g_song_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);

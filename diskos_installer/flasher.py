@@ -18,16 +18,23 @@ from . import bundle, platform_probe
 from .reporter import CLIReporter
 from .errors import FlashError, DEVICE_RESULT_CODES, RECOVERABLE
 
-IMG_SIZE = 76021760
+IMG_SIZE = 100663296
 SQUASH_MAGIC = b"hsqs"
+
+# usbboot waits FLASH_WAIT seconds for the writer, then reads the DONE marker back. The writer
+# finishes well inside this on real hardware (validated repeatedly). A too-short wait shows as a
+# not-DONE readback (retry with a longer wait) - it never corrupts the flash. A device with an
+# unusually high bad-block count can raise it via DISKOS_FLASH_WAIT.
+FLASH_WAIT = os.environ.get("DISKOS_FLASH_WAIT", "900")   # 15 min (was 5400/90 min)
+_FLASH_WAIT_SECS = int(FLASH_WAIT) if FLASH_WAIT.isdigit() else 900
 
 RESULT_NAMES = {code: name for code, (_fcode, name) in DEVICE_RESULT_CODES.items()}
 
-FLASH_EXPECT_SECS = 75 * 60   # ~60-90 min; expected writer duration
-# Hard ceiling for the whole usbboot invocation: the writer's own --wait is 5400s (90 min);
-# give it that plus margin for the image download + result readback, then treat a still-running
-# usbboot as a hung/reset device and terminate it (E303) rather than blocking forever.
-FLASH_HARD_TIMEOUT_SECS = 5400 + 20 * 60   # 90 min writer + 20 min margin
+FLASH_EXPECT_SECS = 15 * 60   # ~15 min expected flash duration
+# Hard ceiling for the whole usbboot invocation: the writer --wait plus margin for the image
+# download + result readback; then treat a still-running usbboot as a hung/reset device and
+# terminate it (E303) rather than blocking forever.
+FLASH_HARD_TIMEOUT_SECS = _FLASH_WAIT_SECS + 15 * 60   # writer wait + 15 min margin
 
 
 def _probe_helpers():
@@ -97,6 +104,8 @@ def _parse_debug(dbg_path):
     nbad = w[20]
     return {
         "magic": w[0],
+        "start_block": w[5],
+        "nlogblocks": w[6],   # writer's compiled logical-block capacity - MUST cover the whole image
         "done": w[9],
         "skipped": w[10],
         "result": w[16],
@@ -105,6 +114,24 @@ def _parse_debug(dbg_path):
         "bad_found": nbad,
         "bad_list": [w[40 + i] for i in range(min(nbad, 64))],
     }
+
+
+def _writer_capacity(writer_path):
+    """The NAND writer only programs its compiled NLOGBLOCKS logical blocks; a stale writer (the old
+    580-block build) silently TRUNCATES the image and the device still reports success for the part it
+    wrote. Read that capacity from the writer's `addiu $v0, $zero, NLOGBLOCKS` instruction (offset 0x40c)
+    so a mismatch is refused BEFORE any NAND write - not only caught in the post-write readback (E311),
+    by which point the device already holds a truncated, unbootable image. Returns the block count, or
+    None if the writer's layout is unrecognised (caller fails closed)."""
+    try:
+        with open(writer_path, "rb") as f:
+            f.seek(0x40c)
+            instr = struct.unpack("<I", f.read(4))[0]
+    except Exception:
+        return None
+    if (instr & 0xFFFF0000) != 0x24020000:   # not `addiu $v0,$zero,imm` -> writer build changed; don't trust the offset
+        return None
+    return instr & 0xFFFF
 
 
 def flash(image_path, log_path=None, rep=None):
@@ -118,6 +145,23 @@ def flash(image_path, log_path=None, rep=None):
     writer = bundle.native("my_write5_dram.bin")
     spl = bundle.native("disc_spl_lpddr3.bin")
 
+    # PRE-WRITE capacity gate: refuse a truncating writer before it touches the NAND (the post-write
+    # E311 check is too late - the image is already partially programmed). This is the 580-vs-768 bug.
+    need_blocks = IMG_SIZE // (128 * 1024)
+    wcap = _writer_capacity(writer)
+    if wcap is None:
+        raise FlashError(
+            "unrecognised NAND writer build - cannot verify its block capacity before flashing; "
+            "refusing to risk a truncated image", code="E123",
+            action="use a diskOS installer bundle built by this project")
+    if wcap < need_blocks:
+        raise FlashError(
+            f"NAND writer covers only {wcap} x 128 KB blocks but the image needs {need_blocks} - "
+            f"flashing WOULD TRUNCATE the image (nothing has been written). This is the 580-vs-768 "
+            f"writer bug.", code="E124",
+            action=f"reconcile my_write5 to NLOGBLOCKS>={need_blocks} and rebuild the bundle")
+    rep.log(f"writer capacity (pre-write): {wcap} blocks (image needs {need_blocks})")
+
     tmp = tempfile.mkdtemp(prefix="diskos-flash-")
     poison = os.path.join(tmp, "poison.bin")
     dbg = os.path.join(tmp, "dbg.bin")
@@ -129,11 +173,11 @@ def flash(image_path, log_path=None, rep=None):
         "--addr", "0xa0c00000", "--download", writer,
         "--addr", "0xa1000000", "--download", image_path,
         "--addr", "0xa0a00000", "--download", poison,
-        "--start1", "0xa0c00030", "--wait", "5400",
+        "--start1", "0xa0c00030", "--wait", FLASH_WAIT,
         "--addr", "0xa0a00000", "--length", "0x400", "--upload", dbg,
     ]
 
-    rep.phase("Flashing diskOS (mask-ROM) - ~60-90 minutes", destructive=True)
+    rep.phase("Flashing diskOS (mask-ROM) - ~15 minutes", destructive=True)
     rep.warning("Do NOT disconnect the device or let the host sleep during the flash.")
 
     logf = open(log_path, "w") if log_path else open(os.path.join(tmp, "flash.log"), "w")
@@ -190,7 +234,15 @@ def flash(image_path, log_path=None, rep=None):
         d = _parse_debug(dbg)
         ok = (d["magic"] == 0x4004E005 and d["done"] == 0x55555555
               and d["result"] == 0x600DF10C)
+        # SAFETY: the writer only programs its compiled NLOGBLOCKS (dbg[6]) logical blocks. If that is
+        # fewer than the image occupies, the TAIL is silently dropped - and squashfs keeps its
+        # inode/directory/fragment tables at the tail, so a truncated image mounts-fails and won't
+        # boot, WHILE the device still reports SUCCESS for the part it did write. Require the writer's
+        # capacity to cover the whole image. (This is exactly the 580-vs-768 bug; this check catches it.)
+        need_blocks = IMG_SIZE // (128 * 1024)
+        cap_ok = d["nlogblocks"] == need_blocks
         rep.log(f"scan: bad-blocks-found={d['bad_found']} list={d['bad_list']}")
+        rep.log(f"writer capacity: {d['nlogblocks']} blocks (image needs {need_blocks})")
         # B4: dbg[17]/[18] mean retried/worst only on SUCCESS; on the out-of-space /
         # block-write-fail aborts they hold the last phys/logical block; on the other
         # aborts they are 0 and must NOT be shown as "last block" (would be misleading).
@@ -210,6 +262,12 @@ def flash(image_path, log_path=None, rep=None):
                 f"flash FAILED (device result [{fcode}] {name}, "
                 f"magic=0x{d['magic']:08X} done=0x{d['done']:08X})",
                 code="E310", action=RECOVERABLE)
+        if not cap_ok:
+            raise FlashError(
+                f"writer/image size MISMATCH: the flashing tool programs {d['nlogblocks']} x 128 KB "
+                f"blocks but this image needs {need_blocks}. The image was TRUNCATED - the device "
+                f"reports success but will not boot. This is a build/tooling defect; do not ship or "
+                f"trust this build.", code="E311", action=RECOVERABLE)
         rep.ok("flash verified OK")
         return d
     finally:
@@ -256,7 +314,7 @@ class _sleep_inhibited:
         if self.proc is None and self.rep is not None:
             self.rep.warning(
                 "could not auto-inhibit system sleep on this host - make sure your "
-                "computer will NOT sleep/suspend for the next ~90 minutes (a suspend "
+                "computer will NOT sleep/suspend for the next ~15 minutes (a suspend "
                 "mid-flash aborts it; the device stays recoverable).")
         return self
 

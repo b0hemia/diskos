@@ -5,10 +5,12 @@
 #include "art.h"
 #include "ipc.h"
 #include "musicdb.h"   /* persistent per-song accent cache */
+#include "scanner.h"   /* scan_read_chapters: Now Playing shows a book's current chapter */
 #include "artcache.h"   /* persistent decoded-cover cache on SD */
 #include "config.h"
 #include "screens.h"
 #include "anim.h"
+#include "fonts_intl.h"   /* Cyrillic/Greek/Latin-ext fallback (issue #3) */
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -31,6 +33,7 @@
 LV_FONT_DECLARE(font_icons_28)
 #define HEART_FILLED  "\xEF\x80\x84"   /* FA f004 solid heart */
 #define HEART_OUTLINE "\xEF\x82\x8A"   /* FA f08a outline heart */
+#define MOON_ICON     "\xEF\x86\x86"   /* FA f186 moon (audiobook sleep timer) */
 #define MODE_ARROW    "\xEF\x85\xB8"   /* FA f178 long-arrow-right (sequential) */
 #define C_ACCENT     0xFF375F
 
@@ -58,6 +61,8 @@ static lv_obj_t *btn_prev;
 static lv_obj_t *btn_next;
 static lv_obj_t *btn_fav;
 static lv_obj_t *fav_icon;
+static lv_obj_t *btn_sleep;    /* audiobook sleep-timer moon (occupies the heart slot for books) */
+static lv_obj_t *sleep_icon;
 static int g_np_fav, g_np_have, g_fav_px, g_fav_py;
 /* Optimistic-favourite hold: a heart tap flips the widget + sends 0104 before the player
  * confirms via a2. Position (a1) frames trigger a full NP refresh from the OLD is_favorite,
@@ -96,12 +101,15 @@ static int displayed_idx;   /* art buffer (0/1) currently shown; new decodes tar
 static int32_t shown_progress;
 static int  g_scrubbing;     /* finger on the seek arc - don't fight it */
 static long g_track_dur;     /* current track duration (ms) for seek math */
+static long g_seek_lo, g_seek_hi;  /* the ms window the ring spans + seeks within: a chapter for a book, the whole track otherwise */
 /* After releasing a seek, the player keeps streaming the OLD position for a
  * beat before it processes the jump, which makes the arc snap back then jump
  * forward. Hold the display at the seeked target and ignore stale echoes until
  * the player's stream reaches it (or the window lapses). */
 static uint32_t g_seek_hold_until = 0;
-static int32_t  g_seek_target = -1;   /* arc value 0..1000 we seeked to */
+static long     g_seek_target_ms = -1;   /* ABSOLUTE ms we seeked to - window-independent, so a seek that lands on a chapter boundary (window flips) isn't mistaken for a stale echo */
+static long     g_scrub_lo, g_scrub_hi;  /* the ms window LATCHED when a ring drag starts - playback advancing under the finger (a chapter boundary crossed mid-drag) must not reinterpret the arc */
+static char     g_scrub_path[520];       /* the track the drag STARTED on - if the track changes before release, the release seek (computed from the old track's window) must NOT be applied to the new track */
 /* A seek and a back/hub swipe can both start anywhere on the ring, so we tell
  * them apart by DIRECTION: a seek follows the ring (curved / has a vertical
  * component) while back/hub is a long, straight, horizontal slide. Once a drag
@@ -123,10 +131,15 @@ static void mmss(long ms, char *buf, size_t len)
 {
     if(ms < 0) ms = 0;
     long total = ms / 1000;
-    long min = total / 60;
     long sec = total % 60;
-    if(min > 999) min = 999;
-    snprintf(buf, len, "%ld:%02ld", min, sec);
+    long hr  = total / 3600;
+    if(hr > 0){                                  /* audiobook-length: H:MM:SS (music tracks stay M:SS) */
+        long min = (total / 60) % 60;
+        if(hr > 999) hr = 999;
+        snprintf(buf, len, "%ld:%02ld:%02ld", hr, min, sec);
+    } else {
+        snprintf(buf, len, "%ld:%02ld", total / 60, sec);
+    }
 }
 
 static void copy_cstr(char *dst, size_t dst_len, const char *src)
@@ -205,14 +218,22 @@ int ui_np_seek_move(int x, int y){
         if(adx < 26 && ady < 26) return 0;            /* not enough travel to classify; hold the arc */
         if(adx > ady*2){ g_seek_cand = 0; return 0; } /* straight horizontal -> nav swipe (top-of-arc is ambiguous; bias to no-glitch) */
         g_seek_on = 1; g_scrubbing = 1;               /* confirmed: a deliberate ring drag */
+        g_scrub_lo = g_seek_lo; g_scrub_hi = g_seek_hi;   /* latch the window NOW so it can't shift under the finger */
+        if(g_scrub_hi <= g_scrub_lo){ g_scrub_lo = 0; g_scrub_hi = g_track_dur; }
+        copy_cstr(g_scrub_path, sizeof g_scrub_path, g_np_curpath);   /* latch WHICH track this drag is on */
     }
     int32_t v = seek_pt_to_value(x, y);
     lv_arc_set_value(ring, v);
-    if(g_track_dur > 0){
-        long ms = (long)((int64_t)v * g_track_dur / 1000);   /* int64 mul: (long)v*dur overflows >~35min */
-        char b[12]; mmss(ms, b, sizeof b); set_label_text_changed(t_elapsed, b);
-        char r[12]; mmss(g_track_dur - ms, r, sizeof r);
-        char rr[14]; snprintf(rr, sizeof rr, "-%s", r); set_label_text_changed(t_remain, rr);
+    shown_progress = v;   /* keep the render cache in sync with the direct arc write, else set_progress_changed() can skip a needed reset (e.g. drag to a chapter end -> next chapter's progress 0 == a stale cached 0 -> arc stuck at 100%) */
+    {
+        long lo = g_scrub_lo, hi = g_scrub_hi;   /* latched window (music: whole track) */
+        if(hi > lo){
+            long span = hi - lo;
+            long rel  = (long)((int64_t)v * span / 1000);   /* preview is window-relative (chapter for a book) */
+            char b[12]; mmss(rel, b, sizeof b); set_label_text_changed(t_elapsed, b);
+            char r[12]; mmss(span - rel, r, sizeof r);
+            char rr[14]; snprintf(rr, sizeof rr, "-%s", r); set_label_text_changed(t_remain, rr);
+        }
     }
     return 1;
 }
@@ -220,11 +241,28 @@ int ui_np_seek_move(int x, int y){
 int ui_np_seek_release(int x, int y){
     (void)x; (void)y;
     int consumed = 0;
+    /* If the track changed while the finger was down, the drag was computed against the OLD track's
+     * window - applying it to the NEW track would scramble its position and cancel its resume. Compare
+     * against a FRESH player-state read (g_np_curpath is only a per-tick UI snapshot and can lag the
+     * real track). Drop the seek on a mismatch. */
+    if(g_seek_on && g_scrub_path[0]){
+        track_state_t s; ipc_get_state(&s);
+        if(strcmp(g_scrub_path, s.path) != 0){
+            g_seek_cand = 0; g_seek_on = 0; g_scrubbing = 0;
+            lv_arc_set_value(ring, shown_progress);   /* snap the arc back to the real position */
+            return 1;                                 /* consumed the gesture, but issued NO seek */
+        }
+    }
     if(g_seek_on && g_track_dur > 0){
         int32_t v = lv_arc_get_value(ring);
-        g_seek_target = v;
+        long lo = g_scrub_lo, hi = g_scrub_hi;   /* the window latched at drag start */
+        if(hi <= lo){ lo = 0; hi = g_track_dur; }   /* fall back to the whole track */
+        long ms = (hi > lo) ? lo + (long)((int64_t)v * (hi - lo) / 1000) : 0;   /* latched window-relative v -> absolute ms */
+        g_seek_target_ms = ms;
         g_seek_hold_until = lv_tick_get() + 2500;   /* suppress stale echo ~2.5s */
-        ui_seek_to((long)((int64_t)v * g_track_dur / 1000));   /* int64 mul: avoid >~35min overflow */
+        /* only hand control away from a pending book-resume if the seek actually goes out; a failed
+         * send must leave the resume pending so the saved position isn't lost. */
+        if(ui_seek_to(ms) == 0) ui_book_user_seeked(ms);
         consumed = 1;
     }
     g_seek_cand = 0; g_seek_on = 0; g_scrubbing = 0;
@@ -254,7 +292,29 @@ static void style_text(lv_obj_t *obj, const lv_font_t *font, lv_color_t color)
 static void transport_cb(lv_event_t *e)
 {
     const char *cmd = (const char *)lv_event_get_user_data(e);
-    if(cmd) ipc_send_cmd(cmd);
+    if(!cmd) return;
+    ui_defer_sleep();   /* a transport tap changes play state -> don't let the sleep check race a stale read */
+    int is_next = !strcmp(cmd, "0201000C0001"), is_prev = !strcmp(cmd, "0201000C0002");
+    if(is_next || is_prev){
+        track_state_t st; ipc_get_state(&st);
+        if(mdb_is_book_path(st.path)){
+            /* For an audiobook, skipping a whole TRACK is wrong: the on-screen prev/next become a
+             * -15s / +30s time skip (asymmetric: back a sentence, forward past intros/dead air),
+             * clamped to the book. The skip is a manual seek, so it supersedes any pending resume. */
+            long tgt = st.position_ms + (is_next ? 30000 : -15000);
+            if(tgt < 0) tgt = 0;
+            if(st.duration_ms > 0 && tgt > st.duration_ms) tgt = st.duration_ms;
+            if(ui_seek_to(tgt) == 0){   /* only drop the pending resume if the skip actually went out */
+                g_seek_target_ms = tgt;                       /* arm the same stale-echo hold as a drag-seek so */
+                g_seek_hold_until = lv_tick_get() + 2500;     /* the chapter ring jumps straight to the target, no back-flicker */
+                ui_book_user_seeked(tgt);
+            }
+            return;
+        }
+        ui_cancel_book_resume();   /* music: next/prev change the track -> drop any pending resume */
+        ui_disarm_book_eoc();      /* explicit nav -> disarm any end-of-chapter sleep left armed after a rollover */
+    }
+    ipc_send_cmd(cmd);
 }
 
 /* The cover opens Song Info on a TAP, but it is also where a horizontal
@@ -383,10 +443,12 @@ lv_obj_t *ui_header_cb(lv_obj_t *root, const char *title, lv_event_cb_t back_cb)
 
     lv_obj_t *t = lv_label_create(root);
     lv_label_set_text(t, title);
-    lv_obj_set_pos(t, 44, 30); lv_obj_set_size(t, 272, 26);        /* full-width centred, clears chevron */
+    /* Screen-centred (label centre = 104+76 = 180) but bounded to a zone that clears the back chevron on
+     * both sides, so a long album/playlist name truncates with an ellipsis instead of sliding under it. */
+    lv_obj_set_pos(t, 104, 30); lv_obj_set_size(t, 152, 26);
     lv_obj_set_style_text_align(t, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
-    lv_obj_set_style_text_font(t, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_font(t, ui_font_cjk(18), 0);   /* headers show folder/album/playlist names: chain (issue #3) */
     lv_obj_set_style_text_color(t, lv_color_hex(0xFFFFFF), 0);
     return t;
 }
@@ -735,13 +797,18 @@ static int g_accent_gray = 0;   /* currently showing the idle/no-track neutral *
  * compute, no SONG.ACCENT read/write). g_accent_color is 0xRRGGBB. */
 static _Atomic int g_accent_mode = 0;   /* read by art worker/prewarm threads -> atomic */
 static uint32_t    g_accent_color = 0xF23260;   /* UI-thread only */
+static uint32_t    g_static_last  = 0xFFFFFFFFu; /* last static accent actually applied (skip redundant re-applies) */
 int ui_accent_is_static(void){ return g_accent_mode == 1; }   /* worker/prewarm gate */
 
 static void update_accent_seed(const track_state_t *st)
 {
-    if(g_accent_mode == 1){            /* static: fixed colour for every track + no-track */
-        accent = lv_color_hex(g_accent_color);
-        apply_accent();
+    if(g_accent_mode == 1){            /* static: fixed colour; repaint only when it actually changed -
+                                        * the 332x332 arc invalidation is ~85% of the screen every tick */
+        if(g_static_last != g_accent_color){
+            accent = lv_color_hex(g_accent_color);
+            apply_accent();
+            g_static_last = g_accent_color;
+        }
         return;
     }
     if(!st || !st->have_track){
@@ -806,6 +873,48 @@ typedef struct {
     int  is_clear;           /* "no track" - handled on the main thread; worker skips */
 } art_req_t;
 
+/* Serializes the two ffmpeg art decoders (the live NP worker below + the background cover prewarm) so
+ * they never run two ~19MB image pipelines at once (OOM/stall). Held only around the ffmpeg call. */
+static pthread_mutex_t g_decode_mu = PTHREAD_MUTEX_INITIALIZER;
+/* Shared by ALL ffmpeg artwork decoders (live NP, prewarm, AND the vinyl saver) so at most one runs at
+ * once - two ~19MB pipelines together risk OOM. saver.c wraps its decode with these. */
+void ui_decode_lock(void){ pthread_mutex_lock(&g_decode_mu); }
+void ui_decode_unlock(void){ pthread_mutex_unlock(&g_decode_mu); }
+
+/* Album-cover prewarm work queue. The MAIN thread enqueues representative track paths (built with the
+ * in-memory album/track caches, which are NOT thread-safe); the prewarm worker only pops + decodes, so
+ * no mdb in-memory cache is ever touched off the UI thread. Bounded ring: enqueue fails (0) when full,
+ * and the enumerator then pauses rather than dropping albums. */
+#define PWQ_MAX 48   /* the worker drains at ~2/s; the seed self-throttles on a full queue (resumes the same album), so a small ring is plenty */
+static char            pwq[PWQ_MAX][512];
+static int             pwq_head, pwq_tail;
+static pthread_mutex_t pwq_mu = PTHREAD_MUTEX_INITIALIZER;
+int ui_prewarm_enqueue(const char *path){          /* MAIN thread; returns 1 if queued, 0 if full/dup */
+    if(!path || !path[0]) return 1;
+    int ok = 0;
+    pthread_mutex_lock(&pwq_mu);
+    int nt = (pwq_tail+1) % PWQ_MAX;
+    if(nt != pwq_head){
+        int dup = 0;                                /* cheap dedup: same path already pending */
+        for(int i=pwq_head; i!=pwq_tail; i=(i+1)%PWQ_MAX) if(!strcmp(pwq[i], path)){ dup=1; break; }
+        if(dup) ok = 1;
+        else { copy_cstr(pwq[pwq_tail], sizeof pwq[pwq_tail], path); pwq_tail = nt; ok = 1; }
+    }
+    pthread_mutex_unlock(&pwq_mu);
+    return ok;
+}
+static int pwq_pop(char *out, int cap){            /* worker thread; 1 if an item was dequeued */
+    int got = 0;
+    pthread_mutex_lock(&pwq_mu);
+    if(pwq_head != pwq_tail){ copy_cstr(out, cap, pwq[pwq_head]); pwq_head = (pwq_head+1)%PWQ_MAX; got = 1; }
+    pthread_mutex_unlock(&pwq_mu);
+    return got;
+}
+static int pwq_pending(void){ pthread_mutex_lock(&pwq_mu); int p = (pwq_head != pwq_tail); pthread_mutex_unlock(&pwq_mu); return p; }
+static void pw_sleep(int secs){                    /* idle sleep, but wake early the moment cover work is queued */
+    for(int i=0;i<secs;i++){ if(pwq_pending()) return; sleep(1); }
+}
+
 static pthread_mutex_t g_art_mu = PTHREAD_MUTEX_INITIALIZER;
 static art_req_t g_art_target;      /* latest requested decode          (guarded) */
 static unsigned  g_art_req      = 0;/* bumps on each request            (guarded) */
@@ -851,15 +960,22 @@ static void *art_worker(void *arg)
 {
     (void)arg;
     for(;;){
-        art_req_t job; unsigned my_req;
+        art_req_t job; unsigned my_req, my_gen;
         pthread_mutex_lock(&g_art_mu);
         job = g_art_target; my_req = g_art_req;
+        my_gen = art_cancel_gen();   /* capture the cancel token WITH the request: art_cancel() is only called
+                                      * by the setter under g_art_mu, so it can't interleave this snapshot */
         pthread_mutex_unlock(&g_art_mu);
 
         int rc;
         if(job.is_clear) rc = -1;
         else if(artcache_get(job.track, job.out, job.tout, job.bout) == 0) rc = 0;   /* cached -> fast copy, no ffmpeg */
-        else { rc = art_make_all_ex(job.track, job.out, job.tout, job.bout, 1);      /* miss -> decode (killable), then cache */
+        else { pthread_mutex_lock(&g_decode_mu);                                     /* miss -> decode (killable), then cache */
+               /* Pass OUR captured token: if a skip supersedes this decode any time after the snapshot (it
+                * always bumps g_cancel_gen via art_cancel), the per-child gen check trips and no obsolete
+                * decode runs - closing the window between request-validation and the decode. */
+               rc = art_make_all_ex_gen(job.track, job.out, job.tout, job.bout, 1, my_gen);
+               pthread_mutex_unlock(&g_decode_mu);
                if(rc == 0) artcache_put(job.track, job.out, job.tout, job.bout); }
 
         /* compute + cache the OKLab accent HERE (off the UI thread) so apply_art()
@@ -899,9 +1015,167 @@ static void art_request_clear(void)
     art_cancel();   /* kill any in-flight decode so it can't publish stale art */
 }
 
-/* art reuse/staleness key: album title + the track's parent directory */
+/* ---- audiobook chapters: Now Playing shows the current chapter instead of a meaningless album ----
+ * A book's chapters are read once per book (chpl parse), then the current one is picked by position. */
+#define NP_MAXCHAP 256   /* a chpl count is a single byte (<=255) - cover every declared chapter */
+static chapter_t g_chaps[NP_MAXCHAP];
+static int       g_nchaps;
+static char      g_chap_path[256];
+
+/* Build the Now Playing secondary line for a BOOK. Returns 1 if st is a book (out is set - possibly
+ * empty when the book carries no chapters), 0 if it isn't a book (caller shows the album line). */
+static int book_meta_line(const track_state_t *st, char *out, int cap)
+{
+    if(!mdb_is_book_path(st->path)) return 0;
+    if(strcmp(g_chap_path, st->path) != 0){          /* new book -> load its chapters once (udta chpl parse) */
+        g_nchaps = scan_read_chapters(st->path, g_chaps, NP_MAXCHAP);
+        copy_cstr(g_chap_path, sizeof g_chap_path, st->path);
+    }
+    if(g_nchaps <= 0){ out[0] = '\0'; return 1; }    /* a book without chapters: show nothing, not an album */
+    int cur = 0;
+    for(int i = 0; i < g_nchaps; i++){ if(g_chaps[i].start_ms <= st->position_ms) cur = i; else break; }
+    /* The chpl reader fills untitled chapters with "Chapter N"; if this chapter has only that
+     * auto-name, show "Chapter N/M" rather than the redundant "N/M · Chapter N". */
+    char autoname[24]; snprintf(autoname, sizeof autoname, "Chapter %d", cur + 1);
+    if(strcmp(g_chaps[cur].title, autoname) == 0)
+        snprintf(out, cap, "Chapter %d/%d", cur + 1, g_nchaps);
+    else
+        snprintf(out, cap, "%d/%d  \xC2\xB7  %s", cur + 1, g_nchaps, g_chaps[cur].title);   /* 2/3 · Into the Future */
+    return 1;
+}
+
+/* Swap the prev/next transport glyphs between music (track skip) and audiobook (-15s/+30s). Only
+ * touches the widgets when the mode actually changes, so it's cheap to call every update. */
+static int g_np_bookmode = -1;   /* -1 unknown, 0 music, 1 book */
+static void np_transport_glyphs(int book)
+{
+    if(book == g_np_bookmode) return;
+    g_np_bookmode = book;
+    lv_obj_set_style_text_font(btn_prev, book ? &lv_font_montserrat_22 : &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_set_style_text_font(btn_next, book ? &lv_font_montserrat_22 : &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_label_set_text(btn_prev, book ? "-15" : LV_SYMBOL_PREV);
+    lv_label_set_text(btn_next, book ? "+30" : LV_SYMBOL_NEXT);
+}
+
+/* ---- audiobook sleep timer (moon on Now Playing) --------------------------------------------- */
+/* End of the chapter that currently contains the playback position (in book ms), for "End of chapter"
+ * sleep. Reuses the g_chaps cache loaded by book_meta_line. */
+static long book_cur_chapter_end(const track_state_t *st)
+{
+    if(strcmp(g_chap_path, st->path) != 0){
+        g_nchaps = scan_read_chapters(st->path, g_chaps, NP_MAXCHAP);
+        copy_cstr(g_chap_path, sizeof g_chap_path, st->path);
+    }
+    if(g_nchaps <= 0) return st->duration_ms;
+    int cur = 0;
+    for(int i = 0; i < g_nchaps; i++){ if(g_chaps[i].start_ms <= st->position_ms) cur = i; else break; }
+    if(cur + 1 < g_nchaps) return g_chaps[cur+1].start_ms;
+    return st->duration_ms > 0 ? st->duration_ms : g_chaps[cur].start_ms;   /* last chapter ends at the book end */
+}
+
+/* The [start,end] ms window of the chapter currently under the position, for a book with chapters.
+ * Returns 1 (window set) or 0 (not a chaptered book -> caller uses the whole track). Reuses g_chaps. */
+static int book_chapter_window(const track_state_t *st, long *lo, long *hi)
+{
+    if(!mdb_is_book_path(st->path)) return 0;
+    if(strcmp(g_chap_path, st->path) != 0){
+        g_nchaps = scan_read_chapters(st->path, g_chaps, NP_MAXCHAP);
+        copy_cstr(g_chap_path, sizeof g_chap_path, st->path);
+    }
+    if(g_nchaps <= 0) return 0;
+    int cur = 0;
+    for(int i = 0; i < g_nchaps; i++){ if(g_chaps[i].start_ms <= st->position_ms) cur = i; else break; }
+    long a = g_chaps[cur].start_ms;
+    long b = (cur + 1 < g_nchaps) ? g_chaps[cur+1].start_ms
+                                  : (st->duration_ms > 0 ? st->duration_ms : a);
+    if(b <= a) return 0;                 /* degenerate chapter -> fall back to the whole track */
+    *lo = a; *hi = b;
+    return 1;
+}
+
+static lv_obj_t *g_sleep_dlg;
+void ui_np_close_overlays(void){ if(g_sleep_dlg){ lv_obj_del(g_sleep_dlg); g_sleep_dlg = NULL; } }
+int  ui_np_overlay_active(void){ return g_sleep_dlg != NULL; }   /* 1 while the sleep popover is up (main loop suppresses the ring/nav gesture) */
+
+static void sleep_opt_cb(lv_event_t *e)
+{
+    if(lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    int v = (int)(intptr_t)lv_event_get_user_data(e);   /* minutes; 0 = off; -1 = end of chapter */
+    if(v == -1){
+        track_state_t st; ipc_get_state(&st);
+        if(!mdb_is_book_path(st.path)){ ui_set_sleep_timer(0); ui_np_close_overlays(); return; }  /* context changed away from a book */
+        long tgt = book_cur_chapter_end(&st);
+        int at_end = (st.duration_ms > 0 && tgt >= st.duration_ms);   /* book_cur_chapter_end returns EXACTLY the duration only for the last / chapterless chapter -> the target is the file end (a rollover may fulfil it); a mid-book boundary is < duration */
+        if(tgt > st.position_ms){ ui_set_sleep_eoc(tgt, st.path, at_end); ui_toast("Sleep at end of chapter"); }
+        else { ui_set_sleep_timer(0); ui_toast("Sleep timer off"); }
+    } else if(v > 0){
+        ui_set_sleep_timer(v);
+        char b[24]; snprintf(b, sizeof b, "Sleep in %d min", v); ui_toast(b);
+    } else {
+        ui_set_sleep_timer(0); ui_toast("Sleep timer off");
+    }
+    ui_np_close_overlays();
+}
+static void sleep_scrim_cb(lv_event_t *e){ if(lv_event_get_code(e) == LV_EVENT_CLICKED) ui_np_close_overlays(); }
+
+static void sleep_click_cb(lv_event_t *e)
+{
+    if(lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if(g_sleep_dlg){ ui_np_close_overlays(); return; }              /* tap the moon again to dismiss */
+    lv_obj_t *scrim = lv_obj_create(lv_layer_top());               /* full-screen dim; tap outside closes */
+    g_sleep_dlg = scrim;
+    lv_obj_remove_style_all(scrim);
+    lv_obj_set_size(scrim, 360, 360); lv_obj_center(scrim);
+    lv_obj_set_style_bg_color(scrim, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(scrim, LV_OPA_60, 0);
+    lv_obj_add_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(scrim, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(scrim, sleep_scrim_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *panel = lv_obj_create(scrim);
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_size(panel, 224, 296); lv_obj_center(panel);
+    lv_obj_set_style_radius(panel, 16, 0);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x1C1C1E), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0x2C2C2E), 0);
+    lv_obj_set_flex_flow(panel, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    lv_obj_set_style_pad_row(panel, 6, 0);
+    lv_obj_set_style_pad_ver(panel, 14, 0);
+    lv_obj_clear_flag(panel, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *hdr = lv_label_create(panel);
+    lv_label_set_text(hdr, "Sleep Timer");
+    lv_obj_set_style_text_font(hdr, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(hdr, lv_color_hex(0xFFFFFF), 0);
+
+    static const char *OPT_T[] = { "15 min", "30 min", "45 min", "60 min", "End of chapter", "Off" };
+    static const int   OPT_V[] = { 15, 30, 45, 60, -1, 0 };
+    for(unsigned i = 0; i < sizeof OPT_V / sizeof OPT_V[0]; i++){
+        lv_obj_t *b = lv_button_create(panel);
+        lv_obj_remove_style_all(b);
+        lv_obj_set_size(b, 196, 34);
+        lv_obj_set_style_radius(b, 10, 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x2C2C2E), 0);
+        lv_obj_set_style_bg_opa(b, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(b, lv_color_hex(0x3A3A3C), LV_STATE_PRESSED);
+        lv_obj_add_event_cb(b, sleep_opt_cb, LV_EVENT_CLICKED, (void *)(intptr_t)OPT_V[i]);
+        lv_obj_t *l = lv_label_create(b);
+        lv_label_set_text(l, OPT_T[i]);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(l, OPT_V[i] == -1 ? accent : lv_color_hex(0xFFFFFF), 0);
+        lv_obj_center(l);
+    }
+}
+
+/* art reuse/staleness key: album title + the track's parent directory. Audiobooks (.m4b) each carry
+ * their own cover, so key them by full path - two books sharing an album tag in one folder must not
+ * reuse each other's cover. */
 static void make_art_key(const track_state_t *st, char *out, int cap)
 {
+    if(mdb_is_book_path(st->path)){ snprintf(out, cap, "%s", st->path); return; }
     char dir[256]; snprintf(dir, sizeof dir, "%s", st->path);
     char *slash = strrchr(dir, '/'); if(slash) *slash = '\0'; else dir[0] = '\0';
     snprintf(out, cap, "%s\n%s", st->album, dir);
@@ -968,7 +1242,10 @@ static void update_cover_for_path(const track_state_t *st)
             pthread_detach(th);
         } else {                            /* spawn failed -> decode synchronously */
             pthread_mutex_lock(&g_art_mu); g_art_inflight = 0; pthread_mutex_unlock(&g_art_mu);
-            if(art_make_all(job.track, job.out, job.tout, job.bout) == 0) apply_art(&job);
+            pthread_mutex_lock(&g_decode_mu);   /* still exclude the prewarm decoder (spawn failed under memory pressure) */
+            int r = art_make_all(job.track, job.out, job.tout, job.bout);
+            pthread_mutex_unlock(&g_decode_mu);
+            if(r == 0) apply_art(&job);
             else clear_art_state();
         }
     }
@@ -1017,6 +1294,7 @@ void ui_set_accent_config(int mode, int rgb){
         last_seed_a[0] = '\0'; last_seed_b[0] = '\0';   /* force dynamic recompute next ui_update */
     }
     apply_accent();
+    g_static_last = g_accent_mode ? g_accent_color : 0xFFFFFFFFu;   /* config just repainted; keep the guard in sync */
     g_art_applied = 1;   /* re-push Home/Saver/npmenu accent surfaces */
 }
 
@@ -1050,6 +1328,24 @@ static int pw_window_open(void){
     return 1;                          /* m==1: when idle */
 }
 
+/* Block until heat + the live decode allow another ffmpeg. Shared by both prewarm phases. */
+static void pw_wait_window(int *hot){
+    for(;;){
+        int t = pw_temp_dc();                       /* battery temp, tenths-C; fail-closed if unreadable */
+        if(t < 0){ sleep(15); continue; }
+        if(*hot){ if(t < 400) *hot=0; else { sleep(15); continue; } }   /* hysteresis: pause >=42C, resume <40C */
+        else if(t >= 420){ *hot=1; sleep(15); continue; }
+        int busy; pthread_mutex_lock(&g_art_mu); busy=g_art_inflight; pthread_mutex_unlock(&g_art_mu);
+        if(busy){ usleep(300*1000); continue; }     /* never a 2nd ffmpeg while the user's decode runs */
+        return;
+    }
+}
+
+/* PHASE 1 (boot): proactively decode ONE cover per album so the Album (cover flow) view is populated
+ * without playing every album first. Per-album (hundreds) not per-track (thousands), and strictly
+ * battery-temp throttled, so it fills in a couple of minutes on first boot and is near-instant on later
+ * boots (the SD cache persists). Runs regardless of the idle gate - users want covers ready while they
+ * browse - but yields to the live decode and to heat. DB access is safe: g_db is opened FULLMUTEX. */
 static void *art_prewarm_worker(void *arg)
 {
     (void)arg;
@@ -1057,7 +1353,24 @@ static void *art_prewarm_worker(void *arg)
     const char *PC="/tmp/pw_cover.bmp", *PT="/tmp/pw_thumb.bmp", *PB="/tmp/pw_backdrop.bmp";
     int id = 0, hot = 0, did_work = 0;   /* hot = temp hysteresis latch */
     for(;;){
-        if(!pw_window_open()){ id=0; did_work=0; sleep(5); continue; }   /* not allowed now -> wait, restart sweep */
+        /* PHASE 1: album-cover prewarm. The MAIN thread enqueues representative track paths (built with
+         * the non-thread-safe album/track caches); the worker only pops + decodes here, so no mdb
+         * in-memory cache is touched off the UI thread. Runs regardless of the idle gate (users want
+         * covers while browsing) but stays temp-throttled and serialized with the live NP decoder. */
+        char qpath[512];
+        if(pwq_pop(qpath, sizeof qpath)){
+            pw_wait_window(&hot);                        /* heat gate + yields to the live decode */
+            if(!artcache_has(qpath)){
+                pthread_mutex_lock(&g_decode_mu);
+                int r = art_make_all(qpath, PC, PT, PB);
+                pthread_mutex_unlock(&g_decode_mu);
+                if(r == 0) artcache_put(qpath, PC, PT, PB);
+            }
+            usleep(120*1000);                            /* light pace; the temp gate is the real limiter */
+            continue;
+        }
+        /* PHASE 2: per-track idle sweep (accents + any remaining covers), gated on the user setting. */
+        if(!pw_window_open()){ id=0; did_work=0; pw_sleep(5); continue; }   /* not allowed now -> wait (wake for queued covers) */
 
         /* temp throttle: fail-closed if unreadable; hysteresis pause >=42C, resume <40C. */
         int t = pw_temp_dc();
@@ -1071,7 +1384,7 @@ static void *art_prewarm_worker(void *arg)
 
         char path[300];
         if(!mdb_prewarm_next(id, &id, path, sizeof path)){   /* swept the whole library */
-            id=0; sleep(did_work?60:1800); did_work=0; continue;   /* rest longer if nothing was pending */
+            id=0; pw_sleep(did_work?60:1800); did_work=0; continue;   /* rest longer if nothing pending (wake for queued covers) */
         }
         if(!path[0]) continue;
 
@@ -1080,17 +1393,26 @@ static void *art_prewarm_worker(void *arg)
         if(have_art && !need_acc){ usleep(15*1000); continue; }   /* already done -> light skip */
 
         if(!have_art){
-            if(art_make_all(path, PC, PT, PB) == 0) artcache_put(path, PC, PT, PB);
+            pthread_mutex_lock(&g_decode_mu);
+            int r = art_make_all(path, PC, PT, PB);
+            pthread_mutex_unlock(&g_decode_mu);
+            if(r == 0) artcache_put(path, PC, PT, PB);
             else { usleep(300*1000); continue; }                  /* undecodable -> skip */
         }
         if(need_acc){
-            if(have_art) artcache_get(path, PC, PT, PB);          /* materialise the cached cover */
-            uint8_t *buf = malloc(CBMP*CBMP*4);
-            if(buf){
-                uint32_t rgb;
-                if(read_cover_bmp(PC, buf) == 0 && accent_from_buf(buf, &rgb))
-                    mdb_set_song_accent(path, (int)(rgb & 0xFFFFFF));
-                free(buf);
+            /* Materialise THIS path's cover before reading it. If the cached read fails (SD vanished mid-
+             * sweep), PC still holds the PREVIOUS track's image; computing+storing an accent from it would
+             * mislabel this path permanently (a nonzero accent skips future correction). Only proceed on a
+             * confirmed fresh cover for this path (a just-decoded !have_art cover is already in PC). */
+            int cover_ready = have_art ? (artcache_get(path, PC, PT, PB) == 0) : 1;
+            if(cover_ready){
+                uint8_t *buf = malloc(CBMP*CBMP*4);
+                if(buf){
+                    uint32_t rgb;
+                    if(read_cover_bmp(PC, buf) == 0 && accent_from_buf(buf, &rgb))
+                        mdb_set_song_accent(path, (int)(rgb & 0xFFFFFF));
+                    free(buf);
+                }
             }
         }
         did_work = 1;
@@ -1133,15 +1455,34 @@ const char *ui_current_backdrop_src(void)
     return backdrop_valid ? backdrop_src : NULL;
 }
 
-/* Montserrat has no CJK glyphs (titles like "北京" render as boxes). Chain the
- * built-in Source Han Sans CJK font as a fallback for the user-content label fonts. */
-static lv_font_t s_font20, s_font16, s_font14;
+/* Montserrat covers Latin + Latin-Extended only; it has no Cyrillic/Greek (issue #3:
+ * "Ленинград" rendered as boxes) and no CJK ("北京"). Build a per-size fallback chain:
+ *   Montserrat(size) -> font_intl(size) [Cyrillic/Greek/Latin-ext, Noto, uncompressed]
+ *                    -> Source Han 16 [CJK] -> LVGL placeholder.
+ * The intl fonts are generated at matched ascent/descent (base_line 4/5/6 == Montserrat's)
+ * so fallback glyphs sit on the same baseline; LVGL uses the PRIMARY font's line-height, and
+ * each intl line-height (20/23/28) fits within Montserrat's (20/24/28) so nothing clips.
+ * We keep mutable copies because .fallback must be set on non-const fonts. */
+static lv_font_t s_font20, s_font18, s_font16, s_font14;      /* Montserrat, chain heads */
+static lv_font_t s_intl20, s_intl18, s_intl16, s_intl14;      /* intl link (fallback -> Source Han) */
 static void ui_fonts_init(void)
 {
     if(s_font20.get_glyph_dsc) return;   /* once */
-    s_font20 = lv_font_montserrat_20; s_font20.fallback = &lv_font_source_han_16_cjk;
-    s_font16 = lv_font_montserrat_16; s_font16.fallback = &lv_font_source_han_16_cjk;
-    s_font14 = lv_font_montserrat_14; s_font14.fallback = &lv_font_source_han_16_cjk;
+    s_intl20 = font_intl_20; s_intl20.fallback = &lv_font_source_han_16_cjk;
+    s_intl18 = font_intl_18; s_intl18.fallback = &lv_font_source_han_16_cjk;
+    s_intl16 = font_intl_16; s_intl16.fallback = &lv_font_source_han_16_cjk;
+    s_intl14 = font_intl_14; s_intl14.fallback = &lv_font_source_han_16_cjk;
+    s_font20 = lv_font_montserrat_20; s_font20.fallback = &s_intl20;
+    s_font18 = lv_font_montserrat_18; s_font18.fallback = &s_intl18;
+    s_font16 = lv_font_montserrat_16; s_font16.fallback = &s_intl16;
+    s_font14 = lv_font_montserrat_14; s_font14.fallback = &s_intl14;
+}
+
+/* Public accessor for the fallback-chained text font (Montserrat -> intl -> CJK) so other screens
+ * render user text (track/album/artist names) with full glyph coverage. px = 14/16/18/20. */
+const lv_font_t *ui_text_font(int px){
+    ui_fonts_init();
+    switch(px){ case 20: return &s_font20; case 18: return &s_font18; case 14: return &s_font14; default: return &s_font16; }
 }
 
 /* Shared CJK-capable user-text font (montserrat + Source Han Sans fallback) for any screen
@@ -1150,6 +1491,7 @@ const lv_font_t *ui_font_cjk(int size)
 {
     ui_fonts_init();
     if(size >= 20) return &s_font20;
+    if(size >= 18) return &s_font18;
     if(size >= 16) return &s_font16;
     return &s_font14;
 }
@@ -1291,6 +1633,20 @@ void ui_create(lv_obj_t *root)
     lv_obj_center(fav_icon);
     lv_obj_add_flag(btn_fav, LV_OBJ_FLAG_HIDDEN);   /* shown once a track loads */
 
+    /* Audiobook sleep-timer moon - occupies the heart slot for books (heart is hidden for them). */
+    btn_sleep = lv_button_create(scr);
+    lv_obj_remove_style_all(btn_sleep);
+    lv_obj_set_size(btn_sleep, 44, 44);
+    lv_obj_align(btn_sleep, LV_ALIGN_TOP_MID, 118, 126);
+    lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(btn_sleep, sleep_click_cb, LV_EVENT_CLICKED, NULL);
+    sleep_icon = lv_label_create(btn_sleep);
+    lv_obj_set_style_text_font(sleep_icon, &font_icons_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sleep_icon, lv_color_hex(C_TERTIARY), LV_PART_MAIN);
+    lv_label_set_text(sleep_icon, MOON_ICON);
+    lv_obj_center(sleep_icon);
+    lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);   /* shown only for audiobooks */
+
     /* Play-mode toggle - left side, mirrors the heart */
     btn_mode = lv_button_create(scr);
     lv_obj_remove_style_all(btn_mode);
@@ -1354,10 +1710,10 @@ void ui_create(lv_obj_t *root)
     /* Times sit as a centered pair below the transport buttons, inside the
      * arc's bottom gap so they never clash with the green progress fill. */
     t_elapsed = lv_label_create(scr);
-    lv_obj_set_width(t_elapsed, 50);
+    lv_obj_set_width(t_elapsed, 80);   /* fits -999:59:59 at Montserrat 14 */
     style_text(t_elapsed, &lv_font_montserrat_14, lv_color_hex(C_TERTIARY));
     lv_label_set_text(t_elapsed, "0:00");
-    lv_obj_align(t_elapsed, LV_ALIGN_TOP_MID, -40, 318);
+    lv_obj_align(t_elapsed, LV_ALIGN_TOP_MID, -46, 318);
 
     lv_obj_t *t_sep = lv_label_create(scr);
     style_text(t_sep, &lv_font_montserrat_14, lv_color_hex(C_LINE_SOFT));
@@ -1365,10 +1721,10 @@ void ui_create(lv_obj_t *root)
     lv_obj_align(t_sep, LV_ALIGN_TOP_MID, 0, 318);
 
     t_remain = lv_label_create(scr);
-    lv_obj_set_width(t_remain, 50);
+    lv_obj_set_width(t_remain, 80);   /* fits -999:59:59 at Montserrat 14 */
     style_text(t_remain, &lv_font_montserrat_14, lv_color_hex(C_TERTIARY));
     lv_label_set_text(t_remain, "0:00");
-    lv_obj_align(t_remain, LV_ALIGN_TOP_MID, 40, 318);
+    lv_obj_align(t_remain, LV_ALIGN_TOP_MID, 46, 318);
 
     /* page dots - Now Playing is the left page, the hub (right swipe) the right */
     for(int i=0;i<2;i++){
@@ -1411,7 +1767,7 @@ void ui_create(lv_obj_t *root)
     lv_obj_clear_flag(scrim, LV_OBJ_FLAG_CLICKABLE);
 
     fsart_title = lv_label_create(fsart);
-    lv_obj_set_width(fsart_title, 300);
+    lv_obj_set_width(fsart_title, 240);   /* round-screen chord at y~310 is ~249px wide; 300 overran the bezel */
     style_text(fsart_title, &s_font20, lv_color_hex(C_WHITE));
     lv_obj_set_style_text_align(fsart_title, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(fsart_title, LV_LABEL_LONG_DOT);
@@ -1419,7 +1775,7 @@ void ui_create(lv_obj_t *root)
     lv_obj_clear_flag(fsart_title, LV_OBJ_FLAG_CLICKABLE);
 
     fsart_artist = lv_label_create(fsart);
-    lv_obj_set_width(fsart_artist, 280);
+    lv_obj_set_width(fsart_artist, 176);   /* chord at y~334 is only ~186px wide; 280 was clipped by the bezel */
     style_text(fsart_artist, &s_font16, lv_color_hex(C_SECONDARY));
     lv_obj_set_style_text_align(fsart_artist, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(fsart_artist, LV_LABEL_LONG_DOT);
@@ -1432,9 +1788,9 @@ void ui_create(lv_obj_t *root)
 
 void ui_update(const track_state_t *st)
 {
-    char elapsed_buf[8];
-    char remain_core[8];
-    char remain_buf[9];
+    char elapsed_buf[12];   /* room for H:MM:SS (audiobook-length) - mmss now emits hours */
+    char remain_core[12];
+    char remain_buf[14];    /* "-" + H:MM:SS */
     long dur;
     long pos;
     long remain;
@@ -1456,6 +1812,8 @@ void ui_update(const track_state_t *st)
         art_request_clear();   /* clear art + invalidate any in-flight decode (was a bare fallback) */
         g_np_curpath[0] = '\0'; g_favp_active = 0;   /* no track -> drop any optimistic-favourite hold */
         fav_refresh(0, 0);
+        if(btn_sleep) lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);   /* no track -> hide the sleep moon too */
+        ui_np_close_overlays();   /* no track -> dismiss any open sleep popover */
         g_track_dur = 0;
         set_progress_changed(0);
         return;
@@ -1464,10 +1822,12 @@ void ui_update(const track_state_t *st)
     update_cover_for_path(st);   /* first: invalidates stale RAM art on a new album */
     update_accent_seed(st);      /* then: art-accent if THIS track's cover is ready, else text-hash */
 
-    /* count a play once per new track (diskOS play history -> Most-Played / Recently-Played) */
-    if(st->path[0] && strcmp(g_stat_path, st->path) != 0){
-        copy_cstr(g_stat_path, sizeof g_stat_path, st->path);
-        mdb_record_play(st->path);
+    /* count a play once per new track (diskOS play history -> Most-Played / Recently-Played), but
+     * only while actually PLAYING (st->state==2). Otherwise a boot-seeded paused track, or skipping
+     * through tracks while paused, would inflate play counts + recency for songs never really played. */
+    if(st->state==2 && st->path[0] && strcmp(g_stat_path, st->path) != 0){
+        copy_cstr(g_stat_path, sizeof g_stat_path, st->path);          /* track identity always (so a music replay after a book still counts) */
+        if(!mdb_is_book_path(st->path)) mdb_record_play(st->path);     /* but audiobooks are excluded from play history */
     }
 
     set_label_text_changed(title, st->title[0] ? st->title : "Untitled");
@@ -1478,21 +1838,23 @@ void ui_update(const track_state_t *st)
         fsart_refresh_text();
         if(strcmp(fsart_path, st->path) != 0){ copy_cstr(fsart_path, sizeof fsart_path, st->path); fsart_reload_img(); }
     }
-    /* Album line also carries the track position. Never drop the album: append
-     * the position as "Album · N/M" whenever an album exists; show "N / M" alone only when there's
-     * no album at all. */
+    /* Secondary line. For a BOOK it shows the current chapter (an album tag is meaningless for an
+     * audiobook, and the all-songs queue position is noise); for music it's the album, carrying the
+     * track position as "Album · N/M". */
     {
-        const char *alb = st->album;
         char ab[240];
-        if(alb[0] && st->playing_num[0])
-            snprintf(ab, sizeof ab, "%s  \xC2\xB7  %s", alb, st->playing_num);              /* Album · 3/19 */
-        else if(alb[0])
-            snprintf(ab, sizeof ab, "%s", alb);                                             /* Album */
-        else if(st->playing_num[0]){
-            const char *sl = strchr(st->playing_num, '/');
-            if(sl && sl[1]) snprintf(ab, sizeof ab, "%.*s / %s", (int)(sl - st->playing_num), st->playing_num, sl + 1);  /* 3 / 19 */
-            else            snprintf(ab, sizeof ab, "%s", st->playing_num);
-        } else ab[0] = '\0';
+        if(!book_meta_line(st, ab, sizeof ab)){        /* not a book -> album + position */
+            const char *alb = st->album;
+            if(alb[0] && st->playing_num[0])
+                snprintf(ab, sizeof ab, "%s  \xC2\xB7  %s", alb, st->playing_num);          /* Album · 3/19 */
+            else if(alb[0])
+                snprintf(ab, sizeof ab, "%s", alb);                                         /* Album */
+            else if(st->playing_num[0]){
+                const char *sl = strchr(st->playing_num, '/');
+                if(sl && sl[1]) snprintf(ab, sizeof ab, "%.*s / %s", (int)(sl - st->playing_num), st->playing_num, sl + 1);  /* 3 / 19 */
+                else            snprintf(ab, sizeof ab, "%s", st->playing_num);
+            } else ab[0] = '\0';
+        }
         set_label_text_changed(album, ab);
     }
     /* honour an optimistic-favourite hold so a1 position frames don't bounce the heart back */
@@ -1506,6 +1868,24 @@ void ui_update(const track_state_t *st)
     }
     fav_refresh(fav_show, 1);
 
+    /* Audiobook transport: -15/+30 skips instead of track prev/next, and no shuffle or favourite
+     * (they make no sense for a book; the freed space is reserved for the sleep control later). */
+    {
+        int is_book = mdb_is_book_path(st->path);
+        np_transport_glyphs(is_book);
+        if(is_book){
+            lv_obj_add_flag(btn_fav, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(btn_mode, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);   /* moon replaces the heart for books */
+            int armed = ui_sleep_state(NULL);                   /* accent the moon while a timer is set */
+            lv_obj_set_style_text_color(sleep_icon, armed ? accent : lv_color_hex(C_TERTIARY), LV_PART_MAIN);
+        } else {
+            lv_obj_remove_flag(btn_mode, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(btn_sleep, LV_OBJ_FLAG_HIDDEN);
+            ui_np_close_overlays();   /* not a book -> dismiss any open sleep popover (its context is gone) */
+        }
+    }
+
     dur = st->duration_ms;
     g_track_dur = dur;
     pos = st->position_ms;
@@ -1513,25 +1893,33 @@ void ui_update(const track_state_t *st)
     if(pos < 0) pos = 0;
     if(dur > 0 && pos > dur) pos = dur;
 
-    progress = (dur > 0) ? (int32_t)(((long long)pos * 1000LL) / (long long)dur) : 0;
+    /* Seek/progress window: a book's ring + times track the CURRENT CHAPTER (the whole-book
+     * ring is unusable - 1 degree can be minutes on a long book). Music uses the whole track. */
+    if(!book_chapter_window(st, &g_seek_lo, &g_seek_hi)){ g_seek_lo = 0; g_seek_hi = dur; }
+    long span = g_seek_hi - g_seek_lo;
+    long rel  = pos - g_seek_lo;
+    if(rel < 0) rel = 0;
+    if(span > 0 && rel > span) rel = span;
+
+    progress = (span > 0) ? (int32_t)(((long long)rel * 1000LL) / (long long)span) : 0;
 
     /* seek echo-suppression: while the post-seek hold is active and the player
      * is still streaming a stale (far-from-target) position, keep the arc and
      * times pinned at the seeked target instead of snapping back. */
     if(g_seek_hold_until) {
-        int d = (int)progress - (int)g_seek_target; if(d < 0) d = -d;
-        if(lv_tick_get() < g_seek_hold_until && d > 30) {
+        long d = pos - g_seek_target_ms; if(d < 0) d = -d;   /* ABSOLUTE ms gap - unaffected by a chapter-window flip at a seek-to-boundary */
+        if(lv_tick_get() < g_seek_hold_until && d > 3000) {
             set_label_text_changed(btn_pp, st->state == 2 ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
             return;   /* ignore this stale echo */
         }
-        g_seek_hold_until = 0; g_seek_target = -1;   /* caught up or window lapsed */
+        g_seek_hold_until = 0; g_seek_target_ms = -1;   /* caught up or window lapsed */
     }
 
-    mmss(pos, elapsed_buf, sizeof(elapsed_buf));
+    mmss(rel, elapsed_buf, sizeof(elapsed_buf));   /* elapsed within the window (chapter for a book) */
     set_label_text_changed(t_elapsed, elapsed_buf);
 
-    if(dur > 0) {
-        remain = dur - pos;
+    if(span > 0) {
+        remain = span - rel;
         if(remain < 0) remain = 0;
         mmss(remain, remain_core, sizeof(remain_core));
         snprintf(remain_buf, sizeof(remain_buf), "-%s", remain_core);

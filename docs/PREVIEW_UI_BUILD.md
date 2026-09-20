@@ -53,7 +53,7 @@ for p in $(pidof mq_ui); do [ "$(readlink /proc/$p/exe)" != /usr/data/mq_ui ] &&
 ### 4. Look at it
 
 Your build is live on the screen. Tap around, watch the boot ring, judge the change. When you're done
-- or if anything looks off - just **reboot the Disc** and the flashed build returns automatically.
+(or if anything looks off), just **reboot the Disc** and the flashed build returns automatically.
 
 ## Two things that matter
 
