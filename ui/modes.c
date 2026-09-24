@@ -31,7 +31,7 @@ static void mark_selected_mode(int cur){
         }
     }
 }
-static void mark_selected(void){ mark_selected_mode(ui_get_source_mode()); }
+static void mark_selected(void){ mark_selected_mode(ui_source_switch_failed() ? -1 : ui_get_source_mode()); }
 
 
 static uint32_t g_last_switch = 0;   /* debounce: a switch takes a few seconds to apply in the player */
@@ -56,8 +56,12 @@ static int g_pending_mode = -1;   /* the mode a switch is settling to (so reopen
 /* M17: after the switch window, settle to the CONFIRMED mode read from the real USB gadget state,
  * not a blind assumption. If the gadget shows the switch didn't take, reflect reality + say so. */
 static void settle_cb(lv_timer_t *t){
-    (void)t; lv_timer_del(g_settle); g_settle = NULL;
+    (void)t;
+    if(ui_source_switch_pending()) return;
+    if(lv_tick_elaps(g_last_switch) < 3200) return;
+    lv_timer_del(g_settle); g_settle = NULL;
     int intended = g_pending_mode; g_pending_mode = -1;
+    if(ui_source_switch_failed()){ mark_selected_mode(-1); return; }
     /* M17: DISPLAY the ACTUAL gadget state (read-only) instead of a blind timer assumption. Do NOT
      * mutate the intent mirror (g_source_mode) - it also guards coldplug, and a transient mid-transition
      * sample must not flip that guard. */
@@ -84,14 +88,12 @@ static void row_cb(lv_event_t *e){
         g_pending_mode = m;
         mark_pending(m);      /* async switch in flight: show "switching", not a confirmed selection */
         if(g_settle) lv_timer_del(g_settle);
-        g_settle = lv_timer_create(settle_cb, 3200, NULL);   /* settle to the checkmark after the switch window */
+        g_settle = lv_timer_create(settle_cb, 500, NULL);   /* settle to the checkmark after the switch window */
         /* honest wording: the frames are queued; the async switch completes a moment later. */
         static const char *msg[N_MODES] = {
             "Switching to local playback", "Switching to USB DAC",
             "Switching to Bluetooth receiving", "Switching to USB storage" };
         ui_toast(msg[m]);
-    } else {
-        ui_toast("Couldn't switch mode");
     }
 }
 

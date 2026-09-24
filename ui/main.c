@@ -18,7 +18,8 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>     /* mount(): direct SD mount fallback when the player's uevent listener won't (V2.40) */
-#include <sys/stat.h>      /* mkdir() for the SD mount point */
+#include <sys/stat.h>
+#include <dirent.h>      /* mkdir() for the SD mount point */
 #include <linux/input.h>   /* EVIOCGKEY / KEY_MAX for the boot-time Vol-Up override */
 #include <net/if.h>
 #include "lvgl/lvgl.h"
@@ -33,6 +34,8 @@
 #include "lastfm.h"
 #include "scanner.h"
 #include "playstate.h"
+#include "sdio.h"
+#include "art.h"
 
 static lv_indev_t *g_touch = NULL;
 static int         g_screen_off = 0;   /* mirrors (bl_state==2) each main-loop iteration; read by the
@@ -195,7 +198,11 @@ static void hwclock_save_tick(lv_timer_t *t){ (void)t; char *a[] = { "hwclock", 
  * WORKMODE : 0102 000C <4-hex mode>   (Roon loop/shuffle; no-op in LOCAL - verify by ear)
  * EQ       : 0689 000C <4-hex preset> (selector - verify)
  * RESCAN   : 0622000C0001 (NAS-family; unverified) */
+int ui_local_playback_allowed(void);   /* defined with the launch verdict, below */
 int ui_seek_to(long ms){
+    /* A seek drives the player's current (card-backed) track, so it is card access like any other: never
+     * before this boot's launch verdict qualified the player, and never while SD access is held. */
+    if(!ui_local_playback_allowed()) return -1;
     if(ms < 0) ms = 0;
     char f[32]; snprintf(f, sizeof f, "01030010%08lX", (unsigned long)ms);
     int rc = ipc_send_cmd(f);   /* 0 = queued OK, -1 = send failed */
@@ -255,7 +262,7 @@ static char g_route_mac[20] = "";
 static int g_playing = 0;   /* published each tick by the main loop's play/pause inference; the routing
                              * fns read THIS, not the raw st.state (which reports 0 while playing). */
 /* After a player restart, the fresh player runs a ~7s late-init on its mode-control thread that can
- * overwrite an output route sent too early. The v2.40 local-init already waits this out (v240_workmode_cb
+ * overwrite an output route sent too early. The v2.40 local-init already waits this out (localplayer_workmode_cb
  * settles ~9s). BT routing must wait the same window: a speaker's bluealsa PCM is already present, so a
  * route sent within the window can be reverted to local by the player's late init - leaving g_route_mac +
  * g_bt_autorouted latched while the player is actually on analog (no recovery). An EXPLICIT armed flag (not
@@ -272,7 +279,9 @@ int ui_player_settling(void){
 static void route_uppercase(const char *in, char *out, int cap){
     int j=0; for(int i=0; in[i] && j<cap-1; i++){ char c=in[i]; if(c>='a'&&c<='z') c-=32; out[j++]=c; } out[j]=0;
 }
+int ui_local_playback_allowed(void);
 int ui_route_bt(const char *mac){
+    if(!ui_local_playback_allowed()) return -1;
     if(!mac) return -1;
     char norm[20]; route_uppercase(mac, norm, sizeof norm);
     if((int)strlen(norm) != 17) return -1;             /* must be AA:BB:CC:DD:EE:FF */
@@ -307,6 +316,7 @@ int ui_route_bt(const char *mac){
     return 0;
 }
 int ui_route_analog(void){
+    if(!ui_local_playback_allowed()) return -1;
     if(!g_route_mac[0]) return 0;                       /* already on local/analog */
     track_state_t st; ipc_get_state(&st);
     int was_playing = g_playing;   /* real play state (raw st.state reports 0 while playing) */
@@ -336,148 +346,223 @@ int ui_route_analog(void){
 static _Atomic int g_source_mode = 0;
 int ui_get_source_mode(void){ return g_source_mode; }
 
-/* ---- SD-write ownership guard (M18) ---------------------------------------
- * The art cache is diskOS's only SD writer (artcache_put -> /tmp/sdcard/.diskos). Before the player
- * hands the card to a USB host (Storage mode exports /dev/mmcblk0), diskOS must not have a write in
- * flight, or the device-side unmount races a host mount = exFAT dual-access. Each art write brackets
- * itself with sd_write_begin()/sd_write_end(); the mode switch calls sd_export_quiesce() before the
- * export (blocks new writes + drains in-flight ones) and sd_export_release() on return to a local
- * (Local/DAC/BT) mode. begin() marks the write in-flight FIRST then checks writability, so a
- * concurrent quiesce either drains this write or this begin() sees writable=0 and skips - no write
- * ever races the export. */
-static int sd_exported_to_host(void);   /* fwd decl: authoritative real gadget-state check (defined below) */
-static _Atomic int g_sd_writable = 1;   /* 1 = diskOS-intended card ownership (fast path/intent) */
-static _Atomic int g_sd_writers  = 0;   /* in-flight diskOS SD writes */
+/* SD operations share an admission gate. It closes before an export is queued and
+ * reopens only after that export was observed and its return mount is confirmed. */
+static int sd_exported_to_host(void);
+static int coldplug_mounted(void);
+static int rmguard_dir_ok(const char *dir);
+static _Atomic int g_sd_writable = 1;
+static _Atomic int g_sd_writers = 0;
+static _Atomic int g_sd_hold = 0;
+/* Player-launch verdict as the UI sees it: -1 = still pending, 0 = launched unprotected/unconfirmed,
+ * 1 = this player's launch was confirmed guarded AND locally owned. Atomic because worker threads read
+ * it through storage_media_local(). Admission stays CLOSED for anything but 1, which is why this is
+ * separate from g_sd_hold: a PENDING verdict must not poison g_sd_phase the way a real hold does. */
+static _Atomic int g_launch_verdict = -1;
+static pthread_mutex_t g_sd_mode_mu = PTHREAD_MUTEX_INITIALIZER;
+#define SD_EXPORT_MARKER "/tmp/.diskos_sd_export_intent"
+typedef enum { SD_LOCAL, SD_DRAIN, SD_WAIT_HOST, SD_HOST, SD_WAIT_LOCAL, SD_UNKNOWN } sd_phase_t;
+static sd_phase_t g_sd_phase = SD_LOCAL;
+static uint32_t g_sd_deadline;
+static int g_sd_return_mode;
+static int g_sd_reissue;
+static void storage_tick(lv_timer_t *t);
+static int storage_media_local(void);
+static int storage_host_confirmed(void);
+int ui_local_playback_allowed(void){
+    return atomic_load(&g_launch_verdict) == 1 && g_sd_phase == SD_LOCAL && !g_sd_hold && sd_io_healthy();
+}
+
 int sd_write_begin(void){
     atomic_fetch_add(&g_sd_writers, 1);
-    /* Skip if the intent is non-local OR the card is ACTUALLY host-exported. The real gadget-state
-     * check (sd_exported_to_host) is the authority, so a release that runs before the player's
-     * teardown completes still can't let a write race a host that owns the card. */
-    if(!atomic_load(&g_sd_writable) || sd_exported_to_host()){ atomic_fetch_sub(&g_sd_writers, 1); return 0; }
+    if(!atomic_load(&g_sd_writable) || sd_exported_to_host()){
+        atomic_fetch_sub(&g_sd_writers, 1); return 0;
+    }
     return 1;
 }
 void sd_write_end(void){ atomic_fetch_sub(&g_sd_writers, 1); }
-/* Block new SD writes + wait for in-flight ones to drain BEFORE handing the card to a USB host, and
- * LATCH the hold. Returns 1 if drained; 0 if a write is still stuck after the timeout -> the caller
- * MUST abort the export (never hand over the card mid-write).
- *
- * There is deliberately NO runtime re-enable. Once a Storage export is intended, SD writes stay
- * latched OFF for the remainder of this diskOS process's life. Re-enabling requires a CONTROLLED
- * RESET - specifically a REBOOT (not a mere UI-only restart / watchdog respawn: the tmpfs SD_EXPORT_MARKER
- * survives that and keeps the next mq_ui fail-closed; only a reboot wipes the marker AND relaunches
- * mq_player with WORK_MODE=0, so no export is pending). No cross-process completion signal exists to prove
- * the stock player's async gadget FIFO drained past an export WITHIN a session, and neither elapsed time nor
- * the RX generation counter can establish it (RX /ui reattachment is independent of the TX /player export
- * submission) - which is exactly why the reboot-scoped tmpfs marker is the signal, not a timer. Cost: art
- * caching stays off after a Storage session until the next restart - acceptable vs. exFAT corruption
- * from a write racing a delayed export. */
-int sd_export_quiesce(void){
-    atomic_store(&g_sd_writable, 0);
-    for(int i = 0; i < 50 && atomic_load(&g_sd_writers) > 0; i++) usleep(10000);   /* up to ~500ms */
-    return atomic_load(&g_sd_writers) == 0;
+int ui_source_switch_failed(void){ return g_sd_phase == SD_UNKNOWN || g_sd_hold; }
+int ui_source_switch_pending(void){
+    return g_sd_phase == SD_DRAIN || g_sd_phase == SD_WAIT_HOST || g_sd_phase == SD_WAIT_LOCAL;
 }
-/* "An SD export was intended" marker, on TMPFS (/tmp is tmpfs, verified on device). ui_set_source_mode
- * writes it the instant Storage is initiated - BEFORE the gadget is actually built - so it also covers the
- * narrow window where the export is only QUEUED in the player's FIFO (sd_exported_to_host() still false).
- *
- * Putting it on tmpfs makes its lifetime EXACTLY one boot: it survives a UI-only restart / watchdog respawn
- * (mq_ui relaunches, /tmp is untouched) but is wiped by a reboot. That is precisely the M18 "controlled
- * reset" boundary: the only valid re-enable is a genuine reboot, where fiio_init relaunches mq_player and the
- * WORK_MODE=0 boot gate guarantees no pending export. So the marker present at startup == "the same
- * long-running player may still have an export pending" -> fail closed; marker absent == a reboot cleared it
- * (or Storage was never used this boot) -> writable. No clock, no timer, no elapsed-time guess (that was the
- * M18-violating mistake): tmpfs clearing IS the drained-past-reset proof. Within a session the marker is
- * moot - g_sd_writable is already latched off by the quiesce. */
-#define SD_EXPORT_MARKER "/tmp/.diskos_sd_export_intent"
-static int sd_export_mark(void){   /* 1 = written (or already present), 0 = failed */
-    int fd = open(SD_EXPORT_MARKER, O_WRONLY|O_CREAT|O_CLOEXEC, 0644);
-    if(fd < 0) return 0;
-    close(fd);
+/* State is recorded BEFORE sending a request, so a UI restart cannot forget a
+ * queued export. E/H/R distinguish an unobserved export from a confirmed one. */
+static int storage_mark(char phase, int mode){
+    char tmp[] = SD_EXPORT_MARKER ".XXXXXX";
+    int fd = mkstemp(tmp); if(fd < 0) return 0;
+    char b[8]; int n = snprintf(b, sizeof b, "%c %d\n", phase, mode);
+    int ok = write(fd, b, (size_t)n) == n && fsync(fd) == 0;
+    if(close(fd) != 0) ok = 0;
+    if(!ok || rename(tmp, SD_EXPORT_MARKER) != 0){ unlink(tmp); return 0; }
     return 1;
 }
-
-/* Serialises the coldplug worker's "check Local + emit SD add" against ui_set_source_mode's "publish
- * mode + queue the gadget export". A plain flag cannot close the check->emit TOCTOU (the worker can
- * pass its Local check, be preempted, and emit after export is queued); this mutex makes the two
- * critical sections mutually exclusive, so no 'add' is ever emitted while an export is being
- * initiated. Held only for microseconds on each side (a sysfs write / a few mq_sends). */
-static pthread_mutex_t g_sd_mode_mu = PTHREAD_MUTEX_INITIALIZER;
-
-/* SD-SAFETY INVARIANT: entering Storage/USB-DAC hands the card to the host via the player's gadget
- * builder, which unmounts /dev/mmcblk0 device-side first (stock behaviour). diskOS's own writable
- * state (song DB, config, logs) lives on /usr/data (NAND), not the SD; it only READS media off the
- * card and those reads fail cleanly once it is exported -> concurrent-access corruption isn't
- * reachable from here. (Art-cache writes to the SD are lazy/paused; a future belt-and-braces step is
- * to quiesce them explicitly before Storage - tracked separately.) */
-int ui_set_source_mode(int mode){
-    if(mode < 0 || mode > 3) return -1;                  /* validate BEFORE touching the audio path */
-    int was_playing = g_playing;
-    if(was_playing && ipc_send_cmd("0201000C0000") < 0) return -1;   /* pause; abort if it won't queue */
-    /* Take the SD-mode lock for the whole publish+export sequence so the coldplug worker cannot emit
-     * an SD 'add' while this export is being initiated. Publish the intended mode FIRST (before any
-     * gadget command) so a worker that runs the instant we unlock already sees the non-Local mode.
-     * BOUNDED acquisition: the coldplug worker can hold this lock across a blocking mount() that stalls
-     * on bad SD I/O; a plain lock here would freeze the LVGL thread (input + polls) indefinitely, and the
-     * boot watchdog is already disarmed. Time out and defer the switch instead. */
-    { struct timespec lts; clock_gettime(CLOCK_REALTIME, &lts);
-      lts.tv_nsec += 200L*1000*1000; if(lts.tv_nsec >= 1000000000L){ lts.tv_sec++; lts.tv_nsec -= 1000000000L; }
-      if(pthread_mutex_timedlock(&g_sd_mode_mu, &lts) != 0) return -1; }   /* coldplug owns the SD lock -> defer, don't block the UI */
-    g_source_mode = mode;
-    /* M18: Storage hands /dev/mmcblk0 to a USB host - block+drain diskOS SD writes (art cache) FIRST so
-     * nothing races the player's device-side unmount. If a write is STUCK (drain times out), abort the
-     * switch rather than export with a write in flight. Any local mode keeps the card ours -> release. */
-    if(mode == 3){
-        if(!sd_export_quiesce()){
-            g_source_mode = 0;
-            pthread_mutex_unlock(&g_sd_mode_mu);
-            fprintf(stderr,"storage switch ABORTED: SD write drain timed out -> stayed local\n"); fflush(stderr);
-            return -1;   /* no export was initiated (no marker written); writes stay held this session and a later process restart re-inits them */
+/* Verifying our own PATH is not enough: the already-running stock player can
+ * have inherited an unprotected environment from an older boot image. */
+static int storage_player_guarded(void){
+    DIR *d = opendir("/proc"); if(!d) return 0;
+    struct dirent *e; int found = 0, ok = 1;
+    while(ok && (e = readdir(d))){
+        if(e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char p[320], comm[64]; snprintf(p, sizeof p, "/proc/%s/comm", e->d_name);
+        FILE *f = fopen(p, "r"); if(!f) continue;
+        char *got = fgets(comm, sizeof comm, f); fclose(f);
+        if(!got || strcmp(comm, "mq_player\n")) continue;
+        found++;
+        snprintf(p, sizeof p, "/proc/%s/environ", e->d_name);
+        f = fopen(p, "r"); if(!f){ ok = 0; break; }
+        char env[8192]; size_t n = fread(env, 1, sizeof env - 1, f);
+        int err = ferror(f); fclose(f); env[n] = 0;
+        if(err || n == sizeof env - 1){ ok = 0; break; }
+        int guarded = 0;
+        for(size_t i = 0; i < n; i += strlen(env + i) + 1){
+            if(strncmp(env + i, "PATH=", 5)) continue;
+            char *path = env + i + 5, *sep = strchr(path, ':');
+            if(sep) *sep = 0;
+            guarded = path[0] == '/' && rmguard_dir_ok(path);
+            break;
         }
-        /* persist the intent BEFORE the gadget commands: a UI restart in the queued-but-not-yet-built window
-         * then seeds fail-closed off the marker. If the marker can't be written (full/RO NAND), that
-         * restart-safety net is gone - so ABORT the export rather than proceed unprotected. The card stays
-         * ours (g_source_mode reset to 0; writes were quiesced and stay held until the next reboot). */
-        if(!sd_export_mark()){
-            g_source_mode = 0;
-            pthread_mutex_unlock(&g_sd_mode_mu);
-            fprintf(stderr,"storage switch ABORTED: could not write the export marker (NAND full/RO?) -> stayed local\n"); fflush(stderr);
-            return -1;
-        }
+        if(!guarded) ok = 0;
     }
-    /* non-Storage modes: NO synchronous release - a Storage selector queued earlier could still be
-     * pending in the player's FIFO, and there is no signal it drained. Writes stay held until the next
-     * reboot (which wipes the tmpfs marker and relaunches the player Local). */
-    int rc = 0;
-    #define SND(f) do{ if(ipc_send_cmd(f) < 0) rc = -1; }while(0)
-    SND("0666000C0006");                                  /* mandatory force-local pre-stop - ALWAYS first */
+    closedir(d);
+    return found > 0 && ok;
+}
+static int source_send(int mode){
+    if(ipc_send_cmd("0666000C0006") < 0) return -1;
     switch(mode){
-        case 0: SND("0642000C0000"); SND("0657000C0008"); break;                     /* Local */
-        case 1: SND("0642000C0002"); SND("0657000C0008"); break;                     /* USB-DAC -> uac2 */
-        case 2: SND("0818000C0000"); SND("0642000C0000"); SND("0657000C0006"); break;/* BT sink */
-        case 3: SND("0642000C0001"); SND("0657000C0008"); break;                     /* Storage -> mass_storage */
+        case 0:
+            if(ipc_send_cmd("0642000C0000") < 0) return -1;
+            return ipc_send_cmd("0657000C0008");
+        case 1:
+            if(ipc_send_cmd("0642000C0002") < 0) return -1;
+            return ipc_send_cmd("0657000C0008");
+        case 2:
+            if(ipc_send_cmd("0818000C0000") < 0 || ipc_send_cmd("0642000C0000") < 0) return -1;
+            return ipc_send_cmd("0657000C0006");
+        case 3:
+            if(ipc_send_cmd("0642000C0001") < 0) return -1;
+            return ipc_send_cmd("0657000C0008");
     }
-    #undef SND
-    if(rc < 0){
-        /* a frame failed to queue -> the transition may be partial. Fail CLOSED to local so we never
-         * strand the SD exported / a half-built gadget while reporting success, then report failure. */
-        ipc_send_cmd("0666000C0006");
-        int rloc = ipc_send_cmd("0642000C0000");   /* force the gadget selector back to local (queued) */
-        ipc_send_cmd("0657000C0008");
-        g_source_mode = 0;
-        /* Do NOT re-allow SD writes here: the recovery frames are only QUEUED, and a previously-queued
-         * Storage selector may still export the card before the recovery executes. Writes stay BLOCKED
-         * and re-enable only from a CONFIRMED-local path (a later successful local switch, or the
-         * per-generation local re-assert in v240_workmode_cb once !sd_exported_to_host()). Meanwhile
-         * sd_write_begin's authoritative sd_exported_to_host() check is the guard. */
+    return -1;
+}
+static void storage_unknown(const char *why){
+    sd_io_hold(); atomic_store(&g_sd_writable, 0); g_sd_phase = SD_UNKNOWN;
+    fprintf(stderr, "storage: %s; SD access remains held\n", why); fflush(stderr);
+    ui_toast("Storage state uncertain - reboot device");
+}
+int ui_set_source_mode(int mode){
+    if(mode < 0 || mode > 3) return -1;
+    if(ui_source_switch_pending()){ ui_toast("Storage is switching"); return -1; }
+    if(g_sd_phase == SD_UNKNOWN || g_sd_hold || !sd_io_healthy()){ ui_toast("SD access is held this boot"); return -1; }
+    /* Every source change drives the player (and USB/card ownership with it), so none may happen before this
+     * boot's launch verdict has qualified the player - a PENDING or negative verdict refuses it too. */
+    if(atomic_load(&g_launch_verdict) != 1){ ui_toast("SD access is not ready yet"); return -1; }
+    if(mode == 3){
+        if(g_sd_phase == SD_HOST) return 0;
+        if(scanner_active()){ ui_toast("Let the library scan finish first"); return -1; }
+        if(!storage_player_guarded()){ ui_toast("Storage protection is unavailable"); return -1; }
+        if(!storage_media_local()){ ui_toast("SD card is not ready"); return -1; }
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200000000L; if(ts.tv_nsec >= 1000000000L){ ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        if(pthread_mutex_timedlock(&g_sd_mode_mu, &ts) != 0){ ui_toast("SD card is busy - try again"); return -1; }
+        if(!storage_mark('D', 3)){ pthread_mutex_unlock(&g_sd_mode_mu); ui_toast("Couldn't prepare USB storage"); return -1; }
+        sd_io_hold(); atomic_store(&g_sd_writable, 0); g_source_mode = 3;
+        g_sd_phase = SD_DRAIN; g_sd_deadline = lv_tick_get() + 20000;
+        art_cancel();
         pthread_mutex_unlock(&g_sd_mode_mu);
-        fprintf(stderr,"source mode %d FAILED mid-sequence -> forced local (recovery queued=%d, SD writes held)\n", mode, rloc==0); fflush(stderr);
-        return -1;
+        return 0;
     }
-    if(mode == 0 && was_playing) ipc_send_cmd("0201000C0000");   /* only Local resumes playback */
-    /* g_source_mode was already published above (before the gadget commands) for coldplug safety. */
-    pthread_mutex_unlock(&g_sd_mode_mu);
-    fprintf(stderr,"source mode -> %d (was_playing=%d)\n", mode, was_playing); fflush(stderr);
+    if(g_sd_phase == SD_HOST){
+        if(!storage_mark('R', mode)){ ui_toast("Couldn't leave USB storage"); return -1; }
+        g_sd_return_mode = mode; g_sd_phase = SD_WAIT_LOCAL;
+        g_sd_deadline = lv_tick_get() + 20000;
+        if(source_send(mode) < 0){ storage_unknown("return request failed"); return -1; }
+        return 0;
+    }
+    int was_playing = g_playing;
+    if(was_playing && ipc_send_cmd("0201000C0000") < 0){ ui_toast("Player is busy - try again"); return -1; }
+    if(source_send(mode) < 0){ ui_toast("Couldn't switch mode"); return -1; }
+    g_source_mode = mode;
+    if(mode == 0 && was_playing) ipc_send_cmd("0201000C0000");
     return 0;
+}
+static void storage_resume_local(void){
+    if(unlink(SD_EXPORT_MARKER) != 0 && errno != ENOENT){ storage_unknown("cannot clear handoff state"); return; }
+    if(!sd_io_resume()){ storage_unknown("local mount changed during return"); return; }
+    atomic_store(&g_sd_writable, 1); g_sd_phase = SD_LOCAL; g_source_mode = g_sd_return_mode;
+    g_sd_reissue = 0;
+    albumwall_prewarm_seed();
+    fprintf(stderr, "storage: local mount confirmed; SD readers and artwork cache resumed\n"); fflush(stderr);
+}
+static void storage_tick(lv_timer_t *t){
+    (void)t;
+    if(g_sd_hold) return;
+    if(!sd_io_healthy()){
+        if(g_sd_phase != SD_UNKNOWN) storage_unknown("artwork decoder did not exit");
+        return;
+    }
+    if(g_sd_phase == SD_LOCAL){
+        if(!sd_io_allowed() && storage_media_local()){
+            if(sd_io_resume() && mdb_total_song_count() == 0 && !mdb_load_failed()) scanner_start();
+        }
+        return;
+    }
+    if(g_sd_phase == SD_DRAIN){
+        if(sd_io_active() == 0 && atomic_load(&g_sd_writers) == 0){
+            if(!storage_mark('E', 3)){ storage_unknown("cannot record export request"); return; }
+            g_sd_phase = SD_WAIT_HOST; g_sd_deadline = lv_tick_get() + 20000;
+            if(g_playing && ipc_send_cmd("0201000C0000") < 0){ storage_unknown("pause request failed"); return; }
+            if(source_send(3) < 0) storage_unknown("export request failed");
+            return;
+        }
+        if((int32_t)(lv_tick_get() - g_sd_deadline) >= 0){
+            /* No export command was sent. Existing readers must finish before the
+             * gate can reopen; never claim a transfer occurred. */
+            storage_unknown("SD readers did not finish");
+        }
+    } else if(g_sd_phase == SD_WAIT_HOST){
+        if(storage_host_confirmed() && !coldplug_mounted()){
+            if(!storage_mark('H', 3)){ storage_unknown("cannot record completed export"); return; }
+            g_sd_phase = SD_HOST;
+            g_sd_reissue = 0;
+            fprintf(stderr, "storage: export confirmed with no local mount\n"); fflush(stderr);
+        } else if((int32_t)(lv_tick_get() - g_sd_deadline) >= 0) storage_unknown("export not confirmed");
+        /* A recovered E/R marker must not drive the player before this launch is qualified: the reissue
+         * is a storage TRANSITION, so it belongs behind the same gate as every other card access. */
+        else if(g_sd_reissue && atomic_load(&g_launch_verdict) == 1 && source_send(3) == 0) g_sd_reissue = 0;
+    } else if(g_sd_phase == SD_WAIT_LOCAL){
+        if(storage_media_local()){ storage_resume_local(); return; }
+        if((int32_t)(lv_tick_get() - g_sd_deadline) >= 0) storage_unknown("return mount not confirmed");
+        /* same gate as the recovered export above: a recovered R marker must not drive the player before
+         * this launch is qualified */
+        else if(g_sd_reissue && atomic_load(&g_launch_verdict) == 1 && source_send(g_sd_return_mode) == 0)
+            g_sd_reissue = 0;
+    }
+}
+static void storage_init(void){
+    sd_io_init(storage_media_local);
+    FILE *f = fopen(SD_EXPORT_MARKER, "r");
+    if(f){
+        char phase = 0; int mode = 0;
+        int n = fscanf(f, "%c %d", &phase, &mode); fclose(f);
+        atomic_store(&g_sd_writable, 0);
+        if(n == 2 && (phase == 'H' || phase == 'E') && storage_host_confirmed() && !coldplug_mounted()){
+            g_sd_phase = storage_mark('H', 3) ? SD_HOST : SD_UNKNOWN; g_source_mode = 3;
+        } else if(n == 2 && phase == 'E' && mode == 3){
+            g_sd_phase = SD_WAIT_HOST; g_source_mode = 3; g_sd_reissue = 1;
+            g_sd_deadline = lv_tick_get() + 20000;
+        } else if(n == 2 && phase == 'R' && mode >= 0 && mode < 3){
+            g_sd_phase = SD_WAIT_LOCAL; g_sd_return_mode = mode; g_source_mode = 3; g_sd_reissue = 1;
+            g_sd_deadline = lv_tick_get() + 20000;
+        } else if(n == 2 && phase == 'D' && !sd_exported_to_host()){
+            /* D is always replaced by E before any export command is sent. */
+            if(unlink(SD_EXPORT_MARKER) == 0){ g_sd_phase = SD_LOCAL; atomic_store(&g_sd_writable, 1); }
+            else g_sd_phase = SD_UNKNOWN;
+        } else g_sd_phase = SD_UNKNOWN;
+    } else if(errno != ENOENT || sd_exported_to_host()){
+        g_sd_phase = SD_UNKNOWN; atomic_store(&g_sd_writable, 0);
+    }
+    if(g_sd_hold){ g_sd_phase = SD_UNKNOWN; atomic_store(&g_sd_writable, 0); }
+    if(g_sd_phase == SD_LOCAL && !g_sd_hold) sd_io_resume();
 }
 
 static int book_session_active(void);   /* fwd: an audiobook is the active playback context (defined with the book statics) */
@@ -489,7 +574,7 @@ void ui_reapply_audio(void){
      * is null" / NO_WORK_MODE start_local failure) is DELIBERATELY NOT sent here. This runs at boot-ready
      * and on reconnect, when a freshly-booted player is still idle-fresh - sending 0666 then either wedges
      * it or doesn't stick (device-verified: work-mode stayed NULL despite this running at cold boot). The
-     * local-init is instead handled by the v2.40 work-mode handshake (v240_workmode_cb), which uses the
+     * local-init is instead handled by the v2.40 work-mode handshake (localplayer_workmode_cb), which uses the
      * player's a607 mode oracle to set + confirm LOCALPLAYER once the player is ready - see there. */
     /* defaults match the device's observed current state (DRE on, Gain low, analog out,
      * Slow-LL filter) so a boot re-apply doesn't change the sound until the user does. */
@@ -549,13 +634,17 @@ static long g_play_initpos = 0;          /* position at play-init: a backward ju
  *    anchor the settle timer on that first response, then send 0666+0657 EXACTLY ONCE per player
  *    generation. Gated Local source + analog output (g_route_mac empty) so it never stomps a BT A2DP
  *    route, never while a play is pending. The play-timeout handler re-asserts once as a safety net. */
-static void v240_workmode_cb(lv_timer_t *t){
+static void localplayer_workmode_cb(lv_timer_t *t){
+    /* These commands drive the player and its USB/card ownership, so they need the same admission as any
+     * other card access: a qualified launch verdict, SD not held, no decoder fault. A pending verdict waits
+     * (the timer retries), it is never a reason to go ahead. */
+    if(!ui_local_playback_allowed()) return;
     static unsigned done_gen = 0xFFFFFFFFu;   /* generation whose one-shot we've already sent */
     static unsigned wait_gen = 0xFFFFFFFFu;   /* generation whose settle timer is running */
     static uint32_t wait_start = 0;
     static unsigned rx_gen  = 0xFFFFFFFFu;    /* generation the rx_base snapshot belongs to */
     static unsigned rx_base = 0;              /* cumulative rx_frames at the start of THIS generation */
-    if(fw_os_ver() != 240){ lv_timer_del(t); return; }
+    if(!fw_needs_localplayer_init()){ lv_timer_del(t); return; }
     if(ui_get_source_mode() != 0 || g_route_mac[0]) return;   /* only while Local source + analog output */
     if(g_play_pending) return;                                 /* never inject 0666 into a starting play */
     if(book_session_active()) return;                          /* never re-init the route under an active book: 0666 interrupts the stream (books clear g_play_pending, so this is the remaining guard) */
@@ -579,8 +668,12 @@ static void v240_workmode_cb(lv_timer_t *t){
     fprintf(stderr,"v2.40 workmode: local-init sent once (gen %u)\n", gen); fflush(stderr);
 }
 void ui_rescan_library(void){
+    if(!ui_local_playback_allowed()){ ui_toast("Return to local playback to scan"); return; }
+    if(scanner_active()){ ui_toast("Library scan already running"); return; }
+    if(!sd_io_allowed()){ ui_toast("SD card is not ready"); return; }
+    if(scanner_start() != 0){ ui_toast("Couldn't start library scan"); return; }
     g_play_scope[0] = '\0'; g_play_pendscope[0] = '\0';
-    scanner_start();   /* diskOS's own SD scan -> rebuild song.db (stock 0622 is a no-op on V2.09) */
+    ui_toast("Scanning library...");
 }
 /* Poll for scan completion: reload the library from the rebuilt DB, refresh the view, toast. */
 /* 1 once every .m4b has been moved out of SONG into BOOKS. Until then a music play (which the stock player
@@ -607,15 +700,18 @@ static void scanner_poll(lv_timer_t *t){
         ui_invalidate_play_scope(); /* the scan may have reordered the player's LIST_SONG_0 -> a scope cached
                                      * mid-scan is now stale, so force the next tap to rebuild not jump */
         int done=0, total=0; scanner_progress(&done, &total);
+        int skipped = scanner_skipped();
         int unsup = scanner_unsupported();   /* AAC/M4A/OGG/... present but not indexable yet */
         char b[80];
         if(mdb_load_failed()) snprintf(b, sizeof b, "Library busy - reopen to refresh");  /* DB error on RELOAD (busy/IO): the shown list is stale/empty, so don't claim the scan's count */
         else if(scanner_no_sd())  snprintf(b, sizeof b, "Insert an SD card to scan");    /* SD not mounted; library kept */
+        else if(total>0 && skipped>0) snprintf(b, sizeof b, "Scanned %d song%s; %d files skipped", total, total==1?"":"s", skipped);
         else if(total>0 && unsup>0)
                              snprintf(b, sizeof b, "Scanned %d song%s (%d unsupported)", total, total==1?"":"s", unsup);
         else if(total>0)     snprintf(b, sizeof b, "Scanned %d song%s", total, total==1?"":"s");
         else if(done>0)      snprintf(b, sizeof b, "Scan failed - library kept");   /* rolled back */
-        else if(unsup>0)     snprintf(b, sizeof b, "No music found (%d file%s not MP3/FLAC/WAV)", unsup, unsup==1?"":"s");
+        else if(skipped>0)   snprintf(b, sizeof b, "Couldn't read %d files - library kept", skipped);
+        else if(unsup>0)     snprintf(b, sizeof b, "No music found (%d unsupported file%s)", unsup, unsup==1?"":"s");
         else                 snprintf(b, sizeof b, "No music found");
         ui_toast(b);
     }
@@ -629,6 +725,25 @@ void ui_invalidate_play_scope(void){ g_play_scope[0] = '\0'; g_play_pendscope[0]
  * 1=playing while position advances, else 0). Exposed so lastfm/route logic share ONE source of
  * truth instead of re-deriving play/pause from position deltas. */
 int ui_is_playing(void){ return g_playing; }
+
+/* Optimistic play/pause icon hint. Play state is INFERRED from position advance with a grace period,
+ * so the transport glyph lags ~1s when PAUSING (the position stops but the inference waits before it
+ * flips to paused); resuming is instant because the position advances immediately. On a play/pause tap
+ * we predict the new state and show it at once; the real inference reconciles a beat later. Main-thread
+ * only (taps + the glyph refresh both run on the LVGL loop), so no locking. */
+static int      g_pp_hint = -1;          /* -1 none; 0 predict paused; 1 predict playing */
+static uint32_t g_pp_hint_until = 0;
+void ui_pp_tap_hint(void){               /* a toggle tap -> predict the opposite of the current state */
+    g_pp_hint = ui_pp_icon_playing(g_playing) ? 0 : 1;
+    g_pp_hint_until = lv_tick_get() + 2200; /* exceeds the 1600ms position-inference grace */
+}
+int ui_pp_icon_playing(int real_playing){
+    if(g_pp_hint >= 0){
+        if((int32_t)(lv_tick_get() - g_pp_hint_until) >= 0){ g_pp_hint = -1; }        /* window lapsed -> trust real */
+        else return g_pp_hint;                                        /* still lagging -> show prediction */
+    }
+    return real_playing;
+}
 /* set absolute volume 0..120 via the decoded 0715 command (class-2:
  * 0715 + LEN(000C) + <level 4hex>).  The player maps this through the same
  * cs43131 gain path as the hardware vol keys. */
@@ -650,6 +765,7 @@ void ui_disarm_book_eoc(void);   /* fwd: defined with the sleep statics below (a
 static int g_book_single_mode = 0;  /* 1 while a book has forced Single play-mode; the next music play restores the user's configured mode */
 static uint32_t g_book_noadopt_until = 0;  /* after an explicit play, don't let book_tick adopt the (possibly still-reported) old book during the transition */
 void ui_play_list(int list_type, const char *name, int pos1){
+    if(!ui_local_playback_allowed()){ ui_toast("Return to local playback first"); return; }
     /* A music list play (not a custom playlist, type 5) makes the stock player build its queue from the
      * UNFILTERED SONG table. If a .m4b hasn't migrated out yet, it would leak into that queue - so ensure
      * migration first, and refuse the play (rather than queue a book) if it still can't complete. */
@@ -677,7 +793,7 @@ void ui_play_list(int list_type, const char *name, int pos1){
      * v2.40 only (V2.09/V2.28 don't drift, and 0666's close_player could disturb their working path);
      * Local source + analog output only (never a BT A2DP route); and only while STOPPED (an active
      * track-jump already has the route+mode correct, and 0666 would gap the audio). */
-    if(fw_os_ver() == 240 && ui_get_source_mode() == 0 && !g_route_mac[0] && !g_playing){
+    if(fw_needs_localplayer_init() && ui_get_source_mode() == 0 && !g_route_mac[0] && !g_playing){
         ipc_send_cmd("0666000C0006");   /* out_dev = local DAC (6) */
         ipc_send_cmd("0657000C0008");   /* LOCALPLAYER work-mode */
     }
@@ -852,6 +968,7 @@ void ui_book_user_seeked(long target_ms){
 
 /* Play an audiobook (v1: single-file .m4b) and resume at resume_ms (0 = start). */
 void ui_play_book(const char *path, long resume_ms){
+    if(!ui_local_playback_allowed()){ ui_toast("Return to local playback first"); return; }
     if(!path || !*path) return;
     /* The path must round-trip the player's 256-byte track path AND survive the a2 frame's JSON
      * re-escape (the decoder reserves 4 bytes), or st.path won't match and resume/checkpoint would
@@ -894,6 +1011,7 @@ void ui_play_book(const char *path, long resume_ms){
 /* ~400ms: confirm the book loaded, apply resume once, then checkpoint + detect finish. */
 static void book_tick(lv_timer_t *t){
     (void)t;
+    if(!ui_local_playback_allowed()) return;
     if(!g_book_sess[0]){
         /* Adopt an orphaned book: after a UI-only restart the player still plays the book but our
          * session was lost, so checkpointing stops. If a book is the current track, re-establish the
@@ -1088,6 +1206,28 @@ int ui_sleep_state(int *secs_left){
 static char g_app_exec[256];
 static int  g_app_pending = 0;
 void app_launch(const char *exec){ snprintf(g_app_exec, sizeof g_app_exec, "%s", exec); g_app_pending = 1; }
+/* Live Vol-Up pin level; 1 = held. Same register map as the boot override (x2000 pinctrl, GPB PxPIN,
+ * bit 13, active low) - the input layer is unusable here because the stock player grabs event0. */
+/* Mapped ONCE and kept: re-opening and re-mapping /dev/mem five times a second is pure waste. NULL if
+ * the mapping is unavailable, in which case the escape below is simply unavailable too (and says so). */
+static volatile uint32_t *gpio_gpb_pin(void){
+    static volatile uint32_t *pin = NULL;
+    static int tried = 0;
+    if(!tried){
+        tried = 1;
+        int mem = open("/dev/mem", O_RDONLY | O_SYNC);
+        if(mem >= 0){
+            void *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, mem, 0x10010000);
+            if(map != MAP_FAILED) pin = (volatile uint32_t *)((char *)map + 0x100);
+            close(mem);
+        }
+    }
+    return pin;
+}
+static int volup_held(void){
+    volatile uint32_t *pin = gpio_gpb_pin();
+    return pin ? (((*pin >> 13) & 1u) ? 0 : 1) : 0;
+}
 static void app_run(const char *exec){
     /* preflight: a missing/non-executable app shouldn't blank the screen for nothing */
     if(access(exec, X_OK) != 0){
@@ -1095,22 +1235,52 @@ static void app_run(const char *exec){
         ui_toast("Can't launch app");
         return;
     }
-    int failed = 0;
+    if(!gpio_gpb_pin()) ui_toast("Note: hold-to-close is unavailable");   /* no silent loss of the escape */
+    int failed = 0, killed = 0;
     pid_t pid = fork();
     if(pid == 0){
+        setpgid(0, 0);                 /* own group so one kill takes any grandchildren too */
         execl(exec, exec, (char*)NULL);
         _exit(127);
     } else if(pid > 0){
         int status = 0;
-        if(waitpid(pid, &status, 0) < 0) failed = 1;                          /* wait failed: status undefined */
-        else if(WIFEXITED(status) && WEXITSTATUS(status) == 127) failed = 1;  /* exec failed */
+        /* EACCES means the child already exec'd, which only happens after IT called setpgid - so the
+         * group exists either way. Any other error means grouping genuinely failed. */
+        int grouped = (setpgid(pid, pid) == 0 || errno == EACCES);
+        /* The app owns the screen until it exits, so a HUNG app used to own it forever - taking Settings,
+         * and with it the user's route back to the stock firmware, for the rest of the session. Wait
+         * without a deadline (a long-running app is legitimate) but keep an escape: hold Vol-Up for ~3s
+         * to force-close it. Measured as elapsed MONOTONIC time, not a count of loop iterations. */
+        struct timespec t0 = {0,0}; int holding = 0;
+        for(;;){
+            pid_t w = waitpid(pid, &status, WNOHANG);
+            if(w == pid) break;
+            if(w < 0 && errno != EINTR){ failed = 1; break; }
+            if(volup_held()){
+                struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+                if(!holding){ holding = 1; t0 = now; }
+                else if(now.tv_sec - t0.tv_sec >= 3){
+                    if(grouped) kill(-pid, SIGKILL);   /* the app and anything it spawned */
+                    kill(pid, SIGKILL);                /* and the app itself, in case grouping failed
+                                                        * or it moved itself to another group */
+                    for(int k = 0; k < 20; k++){       /* bounded reap: never block on a D-state child */
+                        if(waitpid(pid, &status, WNOHANG) == pid) break;
+                        usleep(100000);
+                    }
+                    killed = 1; break;
+                }
+            } else holding = 0;
+            usleep(200000);
+        }
+        if(!failed && !killed && WIFEXITED(status) && WEXITSTATUS(status) == 127) failed = 1;  /* exec failed */
     } else {
         failed = 1;  /* fork failed */
     }
     /* reclaim the screen: invalidate everything and force an immediate redraw */
     lv_obj_invalidate(lv_screen_active());
     lv_refr_now(NULL);
-    if(failed) ui_toast("Launch failed");
+    if(killed)      ui_toast("App force-closed");
+    else if(failed) ui_toast("Launch failed");
 }
 
 /* one-shot: re-request the player's current-track metadata shortly after launch,
@@ -1129,7 +1299,7 @@ static void ipc_connect_retry_cb(lv_timer_t *t){
     if(ipc_start()==0){
         fprintf(stderr,"ipc connected (deferred)\n"); fflush(stderr);
         /* NB: we no longer force SYSCONFIG.WORK_MODE here. A player restart bumps the IPC
-         * generation, so v240_workmode_cb re-asserts Local per generation (0642=no-export +
+         * generation, so localplayer_workmode_cb re-asserts Local per generation (0642=no-export +
          * 0666 route + 0657 LOCALPLAYER audio) once the new player settles. Forcing WORK_MODE
          * on every reconnect would clobber a deliberate per-session USB-Storage/USB-DAC pick;
          * the persisted default is set once at boot + by the flashed pre-launch gate. */
@@ -1179,14 +1349,23 @@ static void crash_log(int sig, siginfo_t *si, void *ucv){
  * before exec is still named "mq_ui" and would satisfy fiio_init's `pgrep -x mq_ui`
  * -> suppress our respawn; killing its group closes that hole. */
 static volatile sig_atomic_t g_bounded_pgid = 0;
+/* ...and its PID. The group only exists if setpgid worked; the PID always identifies the child, so every
+ * kill path signals both. Registered and cleared with SIGALRM blocked (see run_bounded). */
+static volatile sig_atomic_t g_bounded_pid = 0;
 
 static void boot_alarm_handler(int sig){
     (void)sig;
-    /* stderr is already freopen'd to the boot log; write to it directly (no open() -
-     * a filesystem open can itself block and prevent the _exit). */
+    if(g_bounded_pgid > 0) kill(-(pid_t)g_bounded_pgid, SIGKILL);  /* never abandon a stuck child */
+    if(g_bounded_pid > 0) kill((pid_t)g_bounded_pid, SIGKILL);     /* ...even if it never got its group */
+    /* The diagnostic must never be able to PREVENT the exit. stderr points at the boot log on NAND, and
+     * a write to the same storage that wedged us can block indefinitely - so re-arm first with the
+     * DEFAULT disposition: if the write does block, SIGALRM then terminates us anyway and the firmware
+     * watchdog still gets its respawn. All async-signal-safe. */
+    signal(SIGALRM, SIG_DFL);
+    { sigset_t s; sigemptyset(&s); sigaddset(&s, SIGALRM); sigprocmask(SIG_UNBLOCK, &s, NULL); }
+    alarm(5);
     static const char m[] = "=== diskos BOOT WATCHDOG timeout -> exit for respawn ===\n";
     (void)write(2, m, sizeof m - 1);
-    if(g_bounded_pgid > 0) kill(-(pid_t)g_bounded_pgid, SIGKILL);  /* never abandon a stuck child */
     _exit(124);   /* async-signal-safe; fiio_init's `pgrep -x mq_ui` misses -> respawn */
 }
 
@@ -1221,39 +1400,64 @@ static int run_bounded(char *const argv[], int timeout_ms){
     defer_reap_sweep();   /* opportunistically collect any previously-abandoned timed-out child */
     if(!defer_reap_has_slot()) return -1;   /* no reaping capacity (16 children stuck) -> refuse to fork rather
                                              * than spawn a child we couldn't track/reap -> bounds the leak at 16 */
+    /* Block the deadline signal across fork + grouping + registration. A SIGALRM landing inside that
+     * window used to exec the stock player while this child was not yet in g_bounded_pgid, leaving it
+     * running - and, in the launcher, still able to mutate the settings database after stock started. */
+    sigset_t alrm, prev;
+    sigemptyset(&alrm); sigaddset(&alrm, SIGALRM);
+    sigprocmask(SIG_BLOCK, &alrm, &prev);
     pid_t pid = fork();
-    if(pid < 0) return -1;
+    if(pid < 0){ sigprocmask(SIG_SETMASK, &prev, NULL); return -1; }
     if(pid == 0){
         setpgid(0, 0);                 /* own group: one kill takes any grandchildren too */
+        sigprocmask(SIG_SETMASK, &prev, NULL);   /* the child must not inherit our blocked mask */
         for(int fd = 3; fd < 256; fd++) close(fd);   /* don't inherit our fb/mqueue/etc fds */
         int nul = open("/dev/null", O_RDWR);
         if(nul >= 0){ dup2(nul, 0); if(nul > 2) close(nul); }  /* no stdin; keep 1/2 = boot log */
         execvp(argv[0], argv);
         _exit(127);                    /* exec failed */
     }
-    setpgid(pid, pid);                 /* parent side of the setpgid race (ignore EACCES/ESRCH) */
-    g_bounded_pgid = pid;              /* the watchdog will kill this group if it fires mid-run */
+    /* EACCES means the child already exec'd, which says nothing about whether ITS setpgid worked - so the
+     * group is only claimed when it is verified to exist. */
+    int grouped = (setpgid(pid, pid) == 0 || (errno == EACCES && getpgid(pid) == pid));
+    g_bounded_pid = pid;                  /* always: the direct child is killable even without a group */
+    g_bounded_pgid = grouped ? pid : 0;   /* only claim group-kill when the group really exists */
+    sigprocmask(SIG_SETMASK, &prev, NULL);
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
     int rc = -1;
     for(;;){
         int status = 0;
+        /* Reap and unregister with the deadline BLOCKED: once waitpid collects the child its PID is free
+         * for reuse, so a deadline firing between the reap and the unregister would signal a stranger. */
+        sigprocmask(SIG_BLOCK, &alrm, NULL);
         pid_t w = waitpid(pid, &status, WNOHANG);
-        if(w == pid){ rc = (WIFEXITED(status) && WEXITSTATUS(status)==0) ? 0 : -1; break; }
+        if(w == pid){
+            g_bounded_pid = 0; g_bounded_pgid = 0;
+            sigprocmask(SIG_SETMASK, &prev, NULL);
+            rc = (WIFEXITED(status) && WEXITSTATUS(status)==0) ? 0 : -1; break;
+        }
+        sigprocmask(SIG_SETMASK, &prev, NULL);
         if(w < 0 && errno != EINTR && errno != ECHILD){ rc = -1; break; }
         struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
         long ms = (now.tv_sec - t0.tv_sec)*1000 + (now.tv_nsec - t0.tv_nsec)/1000000;
         if(ms >= timeout_ms){
-            kill(-pid, SIGKILL);
+            if(grouped) kill(-pid, SIGKILL);   /* the group, when we know one was established */
+            kill(pid, SIGKILL);                /* and the child itself, always */
             /* bounded reap: try up to ~1s, then hand the PID to the deferred reaper (a D-state child that
              * outlives this window would otherwise zombie on its eventual exit) - never block indefinitely. */
             int reaped = 0;
+            sigprocmask(SIG_BLOCK, &alrm, NULL);        /* same reap/unregister rule as above */
             for(int k = 0; k < 100; k++){ if(waitpid(pid, &status, WNOHANG) == pid){ reaped = 1; break; } usleep(10000); }
             if(!reaped) defer_reap_add(pid);
+            g_bounded_pid = 0; g_bounded_pgid = 0;
+            sigprocmask(SIG_SETMASK, &prev, NULL);
             rc = -1; break;
         }
         usleep(10000);                 /* 10ms poll granularity */
     }
-    g_bounded_pgid = 0;
+    sigprocmask(SIG_BLOCK, &alrm, NULL);
+    g_bounded_pid = 0; g_bounded_pgid = 0;
+    sigprocmask(SIG_SETMASK, &prev, NULL);
     return rc;
 }
 
@@ -1479,6 +1683,7 @@ static void boot_splash_start(void){
     lv_timer_create(splash_out_cb, 2400, NULL);           /* ring ~1.5s, brief hold, then crossfade to home */
 }
 
+static int launch_status_get(void);   /* player-launcher verdict; defined with the launch gate below */
 /* ---- microSD coldplug worker (native thread) -------------------------------
  * mq_player mounts the card by listening for the DISK 'add' uevent on
  * /sys/block/mmcblk0 (device-verified: re-emitting the PARTITION uevent does
@@ -1491,8 +1696,12 @@ static void boot_splash_start(void){
 static int coldplug_mounted(void){
     FILE *m = fopen("/proc/mounts", "r");
     if(!m) return 0;
-    char line[512]; int ok = 0;
-    while(fgets(line, sizeof line, m)) if(strstr(line, " /tmp/sdcard ")){ ok = 1; break; }
+    char line[512], dev[128], target[128]; int ok = 0;
+    while(fgets(line, sizeof line, m)){
+        if(sscanf(line, "%127s %127s", dev, target) != 2) continue;
+        if(!strcmp(target, "/tmp/sdcard") &&
+           (!strcmp(dev, "/dev/mmcblk0p1") || !strcmp(dev, "/dev/mmcblk0"))){ ok = 1; break; }
+    }
     fclose(m);
     return ok;
 }
@@ -1509,14 +1718,12 @@ static void coldplug_log(const char *msg){
  * the LUN. Fail-CLOSED: node present but UDC unreadable -> assume exported. */
 static int sd_exported_to_host(void){
     const char *udcp = "/sys/kernel/config/usb_gadget/storage_demo/UDC";
-    const char *lunp = "/sys/kernel/config/usb_gadget/storage_demo/functions/mass_storage.0/lun.0/file";
+    const char *fndir = "/sys/kernel/config/usb_gadget/storage_demo/functions";
     struct stat sb;
     /* FULLY fail-closed: only a confirmed ENOENT counts as "node absent"; any other stat/read failure is
      * ambiguous gadget state -> assume exported. */
     errno = 0; int have_udc = (stat(udcp, &sb) == 0); int udc_err = (!have_udc && errno != ENOENT);
-    errno = 0; int have_lun = (stat(lunp, &sb) == 0); int lun_err = (!have_lun && errno != ENOENT);
-    if(udc_err || lun_err) return 1;                            /* ambiguous -> exported */
-    if(!have_udc && !have_lun) return 0;                        /* storage_demo genuinely absent -> not exported */
+    if(udc_err) return 1;                                       /* ambiguous -> exported */
     if(have_udc){
         FILE *f = fopen(udcp, "r");
         if(!f) return 1;                                        /* present but unreadable -> exported */
@@ -1524,15 +1731,56 @@ static int sd_exported_to_host(void){
         if(rerr) return 1;                                      /* read error -> exported */
         for(size_t i = 0; i < n; i++) if(b[i] > ' ') return 1;  /* UDC bound -> exported */
     }
-    /* UDC blank/absent: the LUN backing file is authoritative during the blank-UDC transition windows. */
-    if(have_lun){
+    /* UDC blank/absent: the LUN backing file is authoritative during the blank-UDC transition windows.
+     * The mass-storage function name is path-dependent (RE'd player builder: mass_storage.0; stock
+     * storage_config.sh: mass_storage.msg) -> check EVERY mass_storage.* function. A function directory
+     * whose LUN file is missing/unreadable is a gadget mid-construction -> ambiguous -> exported. */
+    errno = 0;
+    DIR *d = opendir(fndir);
+    if(!d) return (errno == ENOENT) ? 0 : 1;                    /* functions dir genuinely absent -> not exported */
+    int exported = 0; struct dirent *e;
+    while(!exported && (e = readdir(d))){
+        if(strncmp(e->d_name, "mass_storage.", 13) != 0) continue;
+        char lunp[300]; snprintf(lunp, sizeof lunp, "%s/%s/lun.0/file", fndir, e->d_name);
         FILE *g = fopen(lunp, "r");
-        if(!g) return 1;                                        /* present but unreadable -> exported */
+        if(!g){ exported = 1; break; }                           /* function present, LUN unreadable -> exported */
         char l[300] = {0}; size_t m = fread(l, 1, sizeof l - 1, g); int rerr = ferror(g); fclose(g);
-        if(rerr) return 1;                                      /* read error -> exported */
-        if(m && strstr(l, "mmcblk0")) return 1;                 /* LUN backs /dev/mmcblk0 -> exported */
+        if(rerr || (m && strstr(l, "mmcblk0"))) exported = 1;   /* read error, or LUN backs /dev/mmcblk0 -> exported */
     }
-    return 0;
+    closedir(d);
+    return exported;
+}
+static int storage_media_local(void){
+    /* The launch verdict gates EVERY admission path (sd_io_init's callback, sd_io_resume, storage_tick,
+     * the play path) - not just the three startup calls. Until the current player's launch is confirmed
+     * we must not read the card at all, because we cannot yet know the delete guard is in effect. */
+    if(atomic_load(&g_launch_verdict) != 1) return 0;
+    return !g_sd_hold && !sd_exported_to_host() && coldplug_mounted();
+}
+/* A conservative "possibly exported" result cannot acknowledge our request.
+ * Require both a bound controller and the actual card backing file. */
+static int storage_host_confirmed(void){
+    const char *base = "/sys/kernel/config/usb_gadget/storage_demo";
+    char p[512], b[320];
+    snprintf(p, sizeof p, "%s/UDC", base);
+    FILE *f = fopen(p, "r"); if(!f) return 0;
+    size_t n = fread(b, 1, sizeof b - 1, f); int err = ferror(f); fclose(f); b[n] = 0;
+    int bound = 0;
+    for(size_t i = 0; i < n; i++) if(b[i] > ' ') bound = 1;
+    if(err || !bound) return 0;
+    snprintf(p, sizeof p, "%s/functions", base);
+    DIR *d = opendir(p); if(!d) return 0;
+    struct dirent *e; int backed = 0;
+    while((e = readdir(d))){
+        if(strncmp(e->d_name, "mass_storage.", 13)) continue;
+        snprintf(p, sizeof p, "%s/functions/%s/lun.0/file", base, e->d_name);
+        f = fopen(p, "r"); if(!f) continue;
+        n = fread(b, 1, sizeof b - 1, f); err = ferror(f); fclose(f); b[n] = 0;
+        while(n && (b[n-1] == '\n' || b[n-1] == '\r')) b[--n] = 0;
+        if(!err && (!strcmp(b, "/dev/mmcblk0") || !strcmp(b, "/dev/mmcblk0p1"))) backed = 1;
+    }
+    closedir(d);
+    return backed;
 }
 /* Is the USB-DAC (uac_demo) gadget bound? Mirror of sd_exported_to_host for the audio gadget. Not a
  * corruption path (no SD block access), so a read failure is treated as "not bound" (fail-open). */
@@ -1569,7 +1817,7 @@ static int sd_cold_mount_allowed(void){
 }
 static void *coldplug_thread(void *arg){
     (void)arg;
-    const int v240 = (fw_os_ver() == 240);
+    const int direct_sd_mount = fw_needs_direct_sd_mount();
     /* Mount the already-inserted microSD at /tmp/sdcard at COLD boot. V2.09/V2.28: the player's uevent
      * listener mounts it once bound (~100s in); we re-emit the disk 'add' to trigger it. V2.40: the
      * player no longer mounts on that nudge, so we mount the card DIRECTLY. Either way this is ONE-SHOT:
@@ -1580,13 +1828,41 @@ static void *coldplug_thread(void *arg){
      * (sd_exported_to_host) so we never touch the block device while a USB host owns it. */
     if(coldplug_mounted()) return NULL;            /* already mounted (player did it / warm restart) */
     coldplug_log("coldplug worker start");
+    /* Do NOTHING to the card until the player launcher has published its verdict. We start before the
+     * player (fiio_init runs mq_ui, sleeps 2s, then the player), so acting on our own checks alone could
+     * mount and read the card before the launcher has established whether the delete guard is actually in
+     * effect. A failure verdict aborts the worker outright - including the synthetic insert event, which
+     * is itself what invokes the stock player's destructive cleanup. No verdict within the window is
+     * treated as a failure. This is a background thread, so waiting here never delays the UI. */
+    for(int w = 0; ; w++){
+        int v = launch_status_get();
+        if(v == 1) break;
+        if(v == 0){ coldplug_log("launcher reported unprotected/unconfirmed - SD left untouched this boot"); return NULL; }
+        if(w >= 40){ coldplug_log("no launcher verdict within 20s - SD left untouched this boot"); return NULL; }
+        struct timespec hs = { 0, 500L*1000*1000 }; nanosleep(&hs, NULL);
+    }
+    /* SD-WIPE SAFETY (2026-09-21): the synthetic disk 'add' makes the stock player run its SD-mount routine,
+     * which does "umount /tmp/sdcard; rm -rf /tmp/sdcard" WITHOUT checking the umount - if the card is
+     * mounted and busy (our scan/prewarm/playback) that empties the card. The rootfs rm guard defuses the
+     * delete; independently we must never create the ordering "event queued -> we direct-mount and read ->
+     * event handled". So on direct-mount firmware the worker has two ONE-WAY phases: direct-mount attempts
+     * first (no event); only if those fail does it fall back to the event, and once an event has been
+     * emitted it NEVER direct-mounts again (a still-queued event could arrive after a later mount). */
+    int nudged = 0;
     for(int i = 0; i < 120; i++){                  /* ~6 min cap (120 x 3s) covers the ~100s listener */
         if(coldplug_mounted()){ coldplug_log("SD mounted - done"); return NULL; }
         pthread_mutex_lock(&g_sd_mode_mu);
         if(ui_get_source_mode() == 0 && !sd_exported_to_host() && !coldplug_mounted() && atomic_load(&g_sd_writable)){
-            int fd = open("/sys/block/mmcblk0/uevent", O_WRONLY | O_CLOEXEC);
-            if(fd >= 0){ ssize_t w = write(fd, "add\n", 4); (void)w; close(fd); }   /* V2.09/V2.28 nudge */
-            if(v240){                              /* V2.40: nudge won't mount -> mount directly, ONCE */
+            if(!direct_sd_mount || nudged || i >= 10){
+                /* V2.09/V2.28: the player's uevent listener mounts the card (bound ~100s in) - bounded retries,
+                 * each only while genuinely unmounted (checked above). V2.40/V2.57: fallback only, after ~30s
+                 * of failed direct mounts, and one-way. */
+                if(direct_sd_mount && !nudged) coldplug_log("direct mount failed -> falling back to the player's uevent listener (one-way: no more direct mounts)");
+                nudged = 1;
+                int fd = open("/sys/block/mmcblk0/uevent", O_WRONLY | O_CLOEXEC);
+                if(fd >= 0){ ssize_t w = write(fd, "add\n", 4); (void)w; close(fd); }
+            }
+            else {                                 /* V2.40/V2.57: direct-mount phase (no event) */
                 /* Guard EACH mount attempt with sd_cold_mount_allowed() (absolute cold-boot window + not
                  * exported), re-evaluated per attempt so a slow exfat mount can't let the vfat fallback
                  * begin outside the window or after a host grabbed the card. The window keeps the safety
@@ -1652,25 +1928,394 @@ static void coldplug_start(void){
     if(pthread_create(&th, NULL, coldplug_thread, NULL) == 0) pthread_detach(th);
 }
 
-#ifdef DISKOS_DIAG_SDTRACE
-/* DIAGNOSTIC ONLY (v240 boot-hang bisection): append a boot-stage marker to the SD
- * card, which is readable post-mortem via a card reader without any shell/serial.
- * Mounts the SD best-effort (it may not be auto-mounted this early). NOT for release. */
-#include <sys/mount.h>
-#include <sys/stat.h>
-static void diag_sd(const char *msg){
-    mkdir("/tmp/sdcard", 0755);
-    mount("/dev/mmcblk0p1", "/tmp/sdcard", "exfat", 0, NULL);
-    mount("/dev/mmcblk0p1", "/tmp/sdcard", "vfat", 0, NULL);
-    int fd = open("/tmp/sdcard/diskos_boottrace.txt", O_WRONLY|O_CREAT|O_APPEND, 0644);
-    if(fd >= 0){ char b[160]; int n = snprintf(b, sizeof b, "%ld %s\n", (long)time(NULL), msg);
-        if(n > 0) { ssize_t w = write(fd, b, (size_t)n); (void)w; } fsync(fd); close(fd); }
+/* ---- stock-player launcher prep + SD guard ---------------------------------
+ * The stock mount routine ignores failed unmounts before recursive cleanup.
+ * Rebuilt images guard /bin/rm itself, plus the first PATH entry, including stock
+ * fallback/watchdog launches. Hand-deploys can establish a verified NAND fallback.
+ * The launcher verifies protection and resets/reads back persisted local mode
+ * itself before exec. Failure holds the launcher instead of starting the player.
+ */
+#define RMGUARD_ROOTFS     "/opt/diskos/bin"
+#define RMGUARD_SYSTEM     "/bin"
+#define RMGUARD_FALLBACK   "/usr/data/diskos/bin"
+static const char RMGUARD_SCRIPT[] =
+    "#!/bin/sh\n"
+    "# diskOS SD guard - installed read-only at /opt/diskos/bin/rm and put FIRST in PATH by the boot hook.\n"
+    "#\n"
+    "# The stock player prepares the card with \"umount /tmp/sdcard\" followed by \"rm -rf /tmp/sdcard\" and never\n"
+    "# checks whether the umount succeeded. When the card is busy (still mounted) the delete runs on the\n"
+    "# mounted card and empties it. This wrapper refuses any rm whose operand is the card mountpoint or\n"
+    "# anything under it; the exact mountpoint gets the stock's legitimate \"remove a stale empty dir\" via a\n"
+    "# NON-recursive rmdir (EBUSY while mounted, fine when empty and unmounted). Everything else is passed to\n"
+    "# the real rm unchanged. The decision is made before any logging; logging is best-effort and can never\n"
+    "# fall through to the real rm. Canonical paths also cover relative paths, repeated slashes,\n"
+    "# dot components and symlink aliases. This is a guard for rm, not a block-device write filter.\n"
+    "# Logging is evidence, not a prerequisite: it writes to NAND, and the caller here is the stock player\n"
+    "# performing its mount cleanup, so a stalled write would stall THAT. Detached and size-capped, it can\n"
+    "# never delay the decision above, which has already been made by the time this runs.\n"
+    "log_bg() {\n"
+    "    { [ -f /usr/data/diskos_rmguard.log ] && [ \"$(/bin/busybox wc -c < /usr/data/diskos_rmguard.log 2>/dev/null)\" -gt 65536 ]; } \\\n"
+    "        || echo \"$(/bin/busybox date '+%F %T' 2>/dev/null) $1\" >> /usr/data/diskos_rmguard.log 2>/dev/null\n"
+    "}\n"
+    "\n"
+    "options=1\n"
+    "for a in \"$@\"; do\n"
+    "    if [ \"$options\" = 1 ]; then\n"
+    "        case \"$a\" in --) options=0; continue ;; -*) continue ;; esac\n"
+    "    fi\n"
+    "    resolved=$(/bin/busybox readlink -f -- \"$a\" 2>/dev/null)\n"
+    "    for operand in \"$a\" \"$resolved\"; do\n"
+    "    case \"$operand\" in\n"
+    "        /tmp/sdcard|/tmp/sdcard/)\n"
+    "            /bin/busybox rmdir /tmp/sdcard 2>/dev/null\n"
+    "            log_bg \"rmdir-only: rm $*\" &\n"
+    "            exit 0 ;;\n"
+    "        /|/tmp|/tmp/|/tmp/sdcard/*)\n"
+    "            log_bg \"blocked: rm $*\" &\n"
+    "            exit 0 ;;\n"
+    "    esac\n"
+    "    done\n"
+    "done\n"
+    "exec /bin/busybox rm \"$@\"\n"
+    "";
+static int rmguard_dir_ok(const char *dir){
+    char p[256];
+    int n = snprintf(p, sizeof p, "%s/rm", dir);
+    if(n < 0 || n >= (int)sizeof p) return 0;
+    /* An executable called rm may be the real destructive command. Verify the complete
+     * wrapper, including existing fallback copies; a header alone is not sufficient. */
+    int fd = open(p, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if(fd < 0) return 0;
+    struct stat sb;
+    const size_t len = sizeof RMGUARD_SCRIPT - 1;
+    int ok = fstat(fd, &sb) == 0 && S_ISREG(sb.st_mode) &&
+             sb.st_size == (off_t)len && access(p, X_OK) == 0;
+    size_t pos = 0;
+    char buf[512];
+    while(ok && pos < len){
+        size_t want = len - pos;
+        if(want > sizeof buf) want = sizeof buf;
+        ssize_t got = read(fd, buf, want);
+        if(got < 0 && errno == EINTR) continue;
+        if(got <= 0 || memcmp(buf, RMGUARD_SCRIPT + pos, (size_t)got) != 0){ ok = 0; break; }
+        pos += (size_t)got;
+    }
+    close(fd);
+    return ok && pos == len;
 }
-#else
-#define diag_sd(m) ((void)0)
+/* Publish the fallback guard on /usr/data (tmp + fsync + rename) and VERIFY it (exact content + exec bit). */
+static int rmguard_write_fallback(void){
+    mkdir("/usr/data/diskos", 0755); mkdir(RMGUARD_FALLBACK, 0755);
+    const size_t len = sizeof RMGUARD_SCRIPT - 1;
+    char tmp[256], dst[256];
+    int nt = snprintf(tmp, sizeof tmp, "%s/.rm.XXXXXX", RMGUARD_FALLBACK);
+    int nd = snprintf(dst, sizeof dst, "%s/rm", RMGUARD_FALLBACK);
+    if(nt < 0 || nt >= (int)sizeof tmp || nd < 0 || nd >= (int)sizeof dst) return 0;
+    /* UI startup and the player launcher may publish concurrently. Each owns its
+     * temporary file, then atomically replaces the same verified destination. */
+    int fd = mkstemp(tmp);
+    if(fd < 0) return 0;
+    int ok = fcntl(fd, F_SETFD, FD_CLOEXEC) == 0;
+    size_t pos = 0;
+    while(ok && pos < len){
+        ssize_t w = write(fd, RMGUARD_SCRIPT + pos, len - pos);
+        if(w < 0 && errno == EINTR) continue;
+        if(w <= 0){ ok = 0; break; }
+        pos += (size_t)w;
+    }
+    if(ok) ok = fchmod(fd, 0755) == 0 && fsync(fd) == 0;
+    if(close(fd) != 0) ok = 0;
+    if(!ok || rename(tmp, dst) != 0){ unlink(tmp); return 0; }
+    int dfd = open(RMGUARD_FALLBACK, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if(dfd < 0) return 0;
+    ok = fsync(dfd) == 0;
+    close(dfd);
+    return ok && rmguard_dir_ok(RMGUARD_FALLBACK);
+}
+/* Ensure an executable guard exists and PATH starts with its directory. Returns 1 if guarded, 0 if NO
+ * guard could be established (caller decides the fail policy). Idempotent; safe to call from the UI and
+ * from the launcher. Only mutates PATH of THIS process (and, for the launcher, the exec'd player). */
+static int rmguard_ensure(void){
+    const char *cur = getenv("PATH");
+    if(!cur || !*cur) cur = "/bin:/sbin:/usr/bin:/usr/sbin";
+    const char *gdir = NULL;
+    if(rmguard_dir_ok(RMGUARD_ROOTFS)) gdir = RMGUARD_ROOTFS;
+    else if(rmguard_dir_ok(RMGUARD_SYSTEM)) gdir = RMGUARD_SYSTEM;
+    else if(rmguard_dir_ok(RMGUARD_FALLBACK) || rmguard_write_fallback()) gdir = RMGUARD_FALLBACK;
+    if(!gdir) return 0;
+    size_t glen = strlen(gdir);
+    if(strncmp(cur, gdir, glen) == 0 && (cur[glen] == ':' || cur[glen] == '\0')) return 1;
+    char np[1024]; int n = snprintf(np, sizeof np, "%s:%s", gdir, cur);
+    if(n <= 0 || n >= (int)sizeof np) return 0;
+    return setenv("PATH", np, 1) == 0;
+}
+static int player_config_absent_without_card(void){
+    struct stat sb;
+    if(stat("/usr/data/fiio/db/sysconfig.db", &sb) == 0 || errno != ENOENT) return 0;
+    /* Let stock create its full default schema only with the card removed.
+     * A corrupt/unreadable existing database never takes this first-run path. */
+    return stat("/sys/class/block/mmcblk0", &sb) != 0 && errno == ENOENT;
+}
+/* ---- launch outcome, published by the player launcher for the UI ------------------------------
+ * On tmpfs, so its lifetime is exactly one boot and it can never carry a stale success into the next.
+ * The UI treats "absent" and "unreadable" as NOT safe, so a launcher that never got to publish (crash,
+ * deadline, read-only /tmp) keeps diskOS's own SD features off without ever delaying the player. */
+#ifndef LAUNCH_STATUS_PATH
+#define LAUNCH_STATUS_PATH "/tmp/.diskos_launch_status"
+#endif
+#ifndef PLAYER_COMM_NAME
+#define PLAYER_COMM_NAME "mq_player"   /* what the launcher becomes after exec; overridden by tests */
+#endif
+#ifndef BOOT_LOG_PATH
+#define BOOT_LOG_PATH "/usr/data/diskos_boot.log"
+#endif
+#ifndef LAUNCH_DEADLINE_S
+#define LAUNCH_DEADLINE_S  20      /* hard cap on the WHOLE preparation path before we exec stock */
 #endif
 
+/* Invalidate any record from an EARLIER player before we start preparing. Without this, player A's
+ * success stays readable while player B is still deciding - and a crash, a deadline or a failed publish
+ * would leave A's success standing in for B. */
+static void launch_status_invalidate(void){ unlink(LAUNCH_STATUS_PATH); }
+
+static void launch_status_publish(int guard, int local){
+    char buf[96];
+    int n = snprintf(buf, sizeof buf, "guard=%d local=%d pid=%ld\n", guard, local, (long)getpid());
+    if(n <= 0 || n >= (int)sizeof buf) return;
+    char tmp[sizeof LAUNCH_STATUS_PATH + 16];
+    if(snprintf(tmp, sizeof tmp, "%s.XXXXXX", LAUNCH_STATUS_PATH) >= (int)sizeof tmp) return;
+    int fd = mkstemp(tmp);              /* unique: a shared name is unsafe with overlapping writers */
+    if(fd < 0) return;
+    size_t len = (size_t)n, pos = 0;
+    while(pos < len){ ssize_t w = write(fd, buf+pos, len-pos); if(w < 0 && errno == EINTR) continue; if(w <= 0) break; pos += (size_t)w; }
+    int ok = (pos == len) && (fchmod(fd, 0644) == 0);
+    close(fd);
+    if(!ok || rename(tmp, LAUNCH_STATUS_PATH) != 0) unlink(tmp);
+}
+/* 1 = THIS player's launch was confirmed; 0 = it was reported unprotected/unconfirmed; -1 = not published
+ * yet, or published by a player that is no longer the one running.
+ *
+ * tmpfs gives the record a BOOT lifetime, which is not the same as a PLAYER-GENERATION lifetime: the
+ * firmware watchdog can respawn the stock player directly, bypassing our launcher entirely, and that
+ * player inherits no verdict. So the recorded pid is verified to still be the live mq_player. Parsing is
+ * strict - a substring match would accept "guard=10". */
+static int launch_status_get(void){
+    int fd = open(LAUNCH_STATUS_PATH, O_RDONLY|O_CLOEXEC);
+    if(fd < 0) return -1;
+    char buf[96]; ssize_t got = read(fd, buf, sizeof buf - 1); close(fd);
+    if(got <= 0) return -1;
+    buf[got] = 0;
+    int guard = -1, local = -1, used = -1; long pid = -1;
+    /* %n gives the consumed length, so trailing junk ("pid=123junk") is rejected rather than ignored. */
+    if(sscanf(buf, "guard=%d local=%d pid=%ld%n", &guard, &local, &pid, &used) != 3) return -1;
+    if(used < 0 || guard < 0 || guard > 1 || local < 0 || local > 1 || pid <= 0) return -1;
+    for(const char *t = buf + used; *t; t++) if(*t != '\n' && *t != ' ' && *t != '\t') return -1;
+    /* identity: the launcher execs INTO the stock player, so the recorded pid is the player's pid */
+    char cp[64]; snprintf(cp, sizeof cp, "/proc/%ld/comm", pid);
+    int cfd = open(cp, O_RDONLY|O_CLOEXEC);
+    if(cfd < 0) return -1;                       /* that player is gone -> no verdict applies */
+    char cn[32]; ssize_t cg = read(cfd, cn, sizeof cn - 1); close(cfd);
+    if(cg <= 0) return -1;
+    cn[cg] = 0;
+    char *nl = strchr(cn, '\n'); if(nl) *nl = 0;
+    if(strcmp(cn, PLAYER_COMM_NAME) != 0) return -1;  /* pid reused by something else */
+    /* A zombie keeps its name, so it would otherwise pass as a live player. */
+    { char sp[64]; snprintf(sp, sizeof sp, "/proc/%ld/stat", pid);
+      int sfd = open(sp, O_RDONLY|O_CLOEXEC);
+      if(sfd < 0) return -1;
+      char sb[256]; ssize_t sg = read(sfd, sb, sizeof sb - 1); close(sfd);
+      if(sg <= 0) return -1;
+      sb[sg] = 0;
+      const char *rp = strrchr(sb, ')');                 /* comm can contain spaces; state follows ") " */
+      if(!rp || !rp[1] || !rp[2]) return -1;
+      if(rp[2] == 'Z' || rp[2] == 'X') return -1;        /* zombie/dead is not a running player */ }
+    /* PIN the generation: once a verdict has been accepted, a DIFFERENT player may not inherit it.
+     * (A replacement writes its own record, or none at all if the firmware watchdog respawned stock
+     * directly - either way this rejects it and the gate timer revokes.) */
+    { static long pinned = 0;
+      if(pinned == 0) pinned = pid;
+      else if(pinned != pid) return -1; }
+    return (guard == 1 && local == 1) ? 1 : 0;
+}
+/* Bounded, best-effort APPEND to the boot log. Usable before stderr is redirected (the launcher runs
+ * long before that) and it never truncates, so a launcher note survives the UI opening the same file. */
+static void boot_note(const char *msg){
+    int fd = open(BOOT_LOG_PATH, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC, 0644);
+    if(fd < 0) return;
+    (void)write(fd, msg, strlen(msg));
+    (void)write(fd, "\n", 1);
+    close(fd);
+}
+/* Local ownership confirmed? Deliberately SEPARATE from the guard check: the two failures are
+ * independent, mean different things, and are reported independently (a single boolean lost that). */
+static int player_local_mode_confirmed(void){
+    /* Check actual host ownership; a saved database mode is not a detach acknowledgement. */
+    if(sd_exported_to_host()) return 0;
+    if(player_config_absent_without_card()) return 1;
+    /* Fresh, bounded reset and read-back in the launcher itself. An old marker from
+     * another UI instance cannot authorize this launch, and elapsed time is not success. */
+    char *a[] = { "sh", "-c",
+        "[ -f /usr/data/fiio/db/sysconfig.db ] && "
+        "sqlite3 -cmd '.timeout 3000' /usr/data/fiio/db/sysconfig.db 'UPDATE SYSCONFIG SET WORK_MODE=0 WHERE ID=1 AND WORK_MODE IS NOT 0' && "
+        "[ \"$(sqlite3 -cmd '.timeout 3000' /usr/data/fiio/db/sysconfig.db 'SELECT WORK_MODE FROM SYSCONFIG WHERE ID=1')\" = \"0\" ]", NULL };
+    if(run_bounded(a, 8000) != 0) return 0;
+    return !sd_exported_to_host();
+}
+/* Normalise signal state before ANY exec. Three separate problems, all of which outlive the exec:
+ *  - a pending alarm is INHERITED, so our watchdog could fire inside the program we hand off to;
+ *  - alarm(0) does not discard a signal that has ALREADY been generated, so we set SIG_IGN and unblock,
+ *    which discards it, before restoring the default;
+ *  - SIG_IGN itself is inherited across exec, so the disposition must end at SIG_DFL, and the blocked
+ *    mask must be cleared (a handler runs with its own signal blocked, so exec'ing from inside one
+ *    would otherwise hand the stock binary a blocked SIGALRM).
+ * Every call here is async-signal-safe, so this is valid from a handler as well as the normal path. */
+static void handoff_signal_reset(void){
+    alarm(0);
+    signal(SIGALRM, SIG_IGN);
+    sigset_t s; sigemptyset(&s); sigaddset(&s, SIGALRM);
+    sigprocmask(SIG_UNBLOCK, &s, NULL);   /* discards an already-generated SIGALRM */
+    signal(SIGALRM, SIG_DFL);             /* SIG_IGN would survive the exec */
+}
+/* The ONE place that hands off to the stock player. Kills any preparation child first: a shell or
+ * sqlite left running would otherwise keep mutating state after stock has started. */
+static void exec_stock_player(void){
+    if(g_bounded_pgid > 0) kill(-(pid_t)g_bounded_pgid, SIGKILL);
+    if(g_bounded_pid > 0) kill((pid_t)g_bounded_pid, SIGKILL);   /* the child itself, grouped or not */
+    handoff_signal_reset();
+    char *pa[2]; pa[0] = (char*)"mq_player"; pa[1] = NULL;
+    execv("/usr/bin/mq_player", pa);
+    _exit(127);                            /* exec failed: let the watchdog respawn stock */
+}
+/* Deadline handler. Deliberately does NO I/O: a write to the boot log or to stderr can itself block on
+ * the very storage that wedged preparation, which would defeat the whole point of having a deadline. */
+static void launch_deadline_exec(int sig){
+    (void)sig;
+    exec_stock_player();
+}
+/* HARD RULE (owner constraint, 2026-09-23): this must NEVER prevent the stock player from running.
+ * diskOS may switch off its OWN features; it may not take away the user's player or their route back
+ * to stock firmware. The earlier version ended in for(;;)pause() while keeping the name mq_player, so
+ * the watchdog saw a live player and never respawned stock - a transient database lock could therefore
+ * deny the device a player until it was reflashed, and it also broke the "Default UI = Stock" and
+ * hold-Vol-Up recovery paths, which only redirect the UI and still route the PLAYER through us.
+ *
+ * Now: bounded attempts under an overall deadline, publish the outcome for the UI, always fall through
+ * to the stock exec. An unprotected launch is NOT claimed to be safe - it is unprotected recovery, and
+ * the UI says so - but it is strictly the user's device to run. */
+static void player_launch_prepare(void){
+    launch_status_invalidate();            /* no earlier player's verdict may stand in for this one */
+    { struct sigaction sa; memset(&sa, 0, sizeof sa);
+      sa.sa_handler = launch_deadline_exec; sigemptyset(&sa.sa_mask);
+      sa.sa_flags = 0;                     /* no SA_RESTART: blocking syscalls return EINTR */
+      sigaction(SIGALRM, &sa, NULL); alarm(LAUNCH_DEADLINE_S); }
+
+    int guard = 0, local = 0;
+    for(int attempt = 0; attempt < 2; attempt++){
+        if(attempt) usleep(250000);        /* one retry for a transient db lock / startup overlap */
+        if(!guard) guard = rmguard_ensure();
+        if(!local) local = player_local_mode_confirmed();
+        if(guard && local) break;
+    }
+    /* The diagnostics stay INSIDE the deadline. They touch NAND, so a stalled write here would
+     * otherwise recreate exactly the failure this deadline exists to prevent: a live launcher that
+     * never reaches the stock player. If the alarm fires during them, the handler execs stock and the
+     * missing note is the acceptable loss. alarm(0) happens in exec_stock_player(), not here. */
+    launch_status_publish(guard, local);
+    if(!guard)      boot_note("launcher: SD guard unavailable - stock player launched UNPROTECTED; diskOS SD features held");
+    else if(!local) boot_note("launcher: local ownership unconfirmed - stock player launched; diskOS SD features held");
+}
+
+/* Start the SD-backed features (first-run scan, cover prewarm) ONLY once the player launcher has
+ * confirmed both the delete guard and local ownership. We run before the player, so our own checks
+ * passing is not sufficient evidence that the launch was protected. A failure verdict, or no verdict
+ * inside the window, holds diskOS's SD features for the boot; it never affects the player. */
+static void sd_degraded_notice_cb(lv_timer_t *t){
+    (void)t;
+    if(g_sd_hold) ui_toast("SD protection unavailable - library and artwork are off");
+}
+static void sd_features_gate_cb(lv_timer_t *t){
+    static int waited = 0, started = 0;
+    int v = launch_status_get();
+    if(v < 0 && !started){
+        if(++waited < 60) return;                    /* ~30s for a launcher that starts 2s after us */
+        v = 0;                                       /* no NAND diagnostic on the UI thread (see below) */
+    }
+    if(v == 1){
+        if(!started){
+            started = 1;
+            atomic_store(&g_launch_verdict, 1);      /* this OPENS admission: storage_tick resumes leases
+                                                      * and runs the first-run scan through its own gate */
+            coldplug_start();                        /* auto-mount the already-inserted card */
+            ui_start_art_prewarm();
+            albumwall_prewarm_seed();
+            lv_timer_set_period(t, 5000);            /* keep re-validating, just less often */
+        }
+        return;
+    }
+    /* Negative, OR the player that earned the verdict is gone. The firmware watchdog can respawn the
+     * stock player directly, which never runs our launcher and so inherits no verdict - we cannot prove
+     * what that replacement did, so this is a ONE-WAY revocation for the rest of the boot. Revoking means
+     * closing admission AND stopping work already in flight, not just setting a flag. */
+    atomic_store(&g_launch_verdict, 0);
+    g_sd_hold = 1;
+    atomic_store(&g_sd_writable, 0);
+    sd_io_hold();                                    /* no new leases */
+    /* Closing admission does NOT stop work already running: a scan holds ONE lease for its whole walk,
+     * and prewarm/fallback decoders are deliberately non-cancellable. Both have to be stopped explicitly
+     * or they keep reading the card after we have declared it unsafe. */
+    scanner_abort();
+    art_kill_all();
+    g_sd_phase = SD_UNKNOWN;
+    g_play_pending = 0;                              /* the pending-playback repair would re-drive the player */
+    /* No NAND diagnostic here: this runs on the UI thread with no deadline, and the earlier version forked
+     * an unsupervised child for it that kept the UI's identity. The on-screen notice is the report. */
+    ui_toast("SD protection unavailable - library and artwork are off");
+    lv_timer_create(sd_degraded_notice_cb, 300000, NULL);   /* recurring, not a single toast */
+    lv_timer_del(t);
+}
+
+/* ---- boot select record (tests slice between these markers - keep them) ----
+ * S96diskos_select writes exactly "diskos\n" or "stock\n". Returns 1 only for a regular, non-symlink file
+ * holding exactly those 7 bytes "diskos\n" - the same rule as payload/diskos-selected, the shell reader
+ * used by S97 and the boot hook, so the three consumers cannot disagree about one record. (The shell side
+ * needs the exact-size rule because BusyBox ash `read` drops NUL bytes.) Missing, unreadable, FIFO/device,
+ * wrong size, NUL-containing or any other content is 0 = stock. Non-blocking open so a FIFO planted at the
+ * path cannot stall us. */
+static int boot_select_is_diskos(const char *path){
+    char rec[8] = {0};
+    ssize_t n = -1;
+    int fd = open(path, O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC);
+    if(fd < 0) return 0;
+    struct stat st;
+    if(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 7)
+        n = read(fd, rec, sizeof rec);
+    close(fd);
+    return n == 7 && memcmp(rec, "diskos\n", 7) == 0;
+}
+
+/* Enforce the record. Anything but a positive diskOS record hands this process to the stock UI, and that
+ * is TERMINAL: if the stock exec fails we exit rather than run diskOS against the boot's decision.
+ * fiio_init's watchdog then sees no mq_ui and respawns the stock UI by its bare name. */
+static void boot_select_enforce(const char *path){
+    if(boot_select_is_diskos(path)) return;
+    handoff_signal_reset();                  /* exec KEEPS a pending timer AND a blocked mask -
+                                              * neither may cross into the stock UI */
+    char *sa[2]; sa[0]="mq_ui"; sa[1]=NULL;
+    execv("/usr/bin/mq_ui", sa);
+    _exit(127);                              /* never fall through into diskOS */
+}
+/* ---- end boot select record ---- */
+
 int main(int argc, char **argv){
+    /* Arm the boot watchdog BEFORE anything else - in particular before the argv dispatch and the
+     * stock-UI selection below. Those read /usr/data and /dev/mem, so they can block; until now they
+     * ran with no deadline at all, and a hang there took away the user's route to the stock firmware
+     * with no recovery but a reflash. On timeout the handler _exit()s, fiio_init's `pgrep -x mq_ui`
+     * misses us, and its watchdog relaunches the bare name - which resolves to the STOCK UI. So a wedge
+     * here now ends up in stock rather than nowhere. Re-armed again below for the init phase proper. */
+    { struct sigaction al; memset(&al,0,sizeof al);
+      al.sa_handler = boot_alarm_handler; sigemptyset(&al.sa_mask); al.sa_flags = 0;
+      sigaction(SIGALRM,&al,NULL); alarm(45); }
 #ifdef DISKOS_DIAG_FBMARK
     /* DIAGNOSTIC: paint the framebuffer magenta the instant our main() runs, so a hung boot can be
      * told apart by eye: WHITE (rcS done) but no magenta => our binary never reached main(); magenta
@@ -1691,67 +2336,52 @@ int main(int argc, char **argv){
         const char *slash = strrchr(a0,'/');
         const char *base = slash ? slash+1 : a0;
         if(strcmp(base,"mq_player")==0){
-            char *pa[2]; pa[0]="mq_player"; pa[1]=NULL;
-            execv("/usr/bin/mq_player", pa);
-            _exit(127);   /* if exec fails, let the watchdog respawn stock */
+            if(strcmp(a0,"mq_player") != 0){
+                /* argv strings are writable. Normalize before any safe hold,
+                 * without re-opening a NAND pathname that could disappear. */
+                size_t old_len = strlen(argv[0]);
+                memmove(argv[0], "mq_player", sizeof "mq_player");
+                memset(argv[0] + sizeof "mq_player", 0, old_len + 1 - sizeof "mq_player");
+            }
+            player_launch_prepare();   /* verified guard + fresh local-mode confirmation */
+            exec_stock_player();       /* single handoff: child cleanup + signal normalisation + exec */
         }
         if(strcmp(a0,"mq_ui")!=0){
             char *ua[3]; ua[0]="mq_ui"; ua[1]=(argc>1?argv[1]:NULL); ua[2]=NULL;
+            handoff_signal_reset();         /* the pending 45s timer must not cross into the new image */
             execv("/usr/data/mq_ui", ua);   /* fall through and run if exec fails */
+            alarm(45);                      /* exec failed: we keep running, so re-arm */
         }
     }
-    /* Boot-default UI + Vol-Up override. fiio_init always launches OUR binary first, so we
-     * decide here whether to run diskOS or hand off to the STOCK UI. Settings->System->"Default
-     * UI" writes /usr/data/boot_default_stock (present => default = Stock). Holding Vol-Up at
-     * power-on boots the OTHER one for this boot - the recovery path back to diskOS from stock,
-     * and vice-versa. Player is always stock (handled by the mq_player symlink).
-     *
-     * DETECTION: we read the Vol-Up GPIO PIN LEVEL directly via /dev/mem - NOT the input layer.
-     * Everything through /dev/input/event0 fails at boot: mq_player grabs event0 (our stream reads
-     * see nothing), and a key held from POWER-ON leaves no EVIOCGKEY state (its GPIO edge predates
-     * the input core, so no press event ever fires). The physical pin level has no such problem.
-     * x2000 pinctrl @ 0x10010000 (one 4KB region per /proc/iomem); ports A-E at 0x100 stride;
-     * PxPIN (live level) @ +0x00. Vol-Up = GPB pin 13 (DT vol-up-key). Register map validated
-     * on-device 2026-08-13 against released states: GPB(0x10010100)=0xF6EFE127 has bits 13/14/15
-     * (vol-up/down/play) high, GPE(0x10010400) bit31 (power) high. Active-low: pressed => bit 0. */
+    /* Boot-default UI + Vol-Up override: CONSUME the boot's one decision, never re-sample it.
+     * S96diskos_select read /usr/data/boot_default_stock and the Vol-Up pin once, before any diskOS code
+     * ran, and wrote exactly "diskos" or "stock" to /tmp/.diskos_boot_select (tmpfs: this boot only).
+     * We used to sample the pin again here, which could disagree with S96: default Stock + Vol-Up held
+     * selected diskOS at S96, the user let go while S97 ran, and we switched back to Stock.
+     * FAILURE POLICY matches S96/S97/the boot hook: only a positive "diskos" record runs diskOS; missing,
+     * unreadable, non-regular or malformed means stock. The read is non-blocking and tmpfs-only, and the
+     * 45s boot watchdog above is already armed if anything here stalls. */
     {
-        int flag_stock = (access("/usr/data/boot_default_stock", F_OK) == 0);
-        int volup = 0, mem_ok = 0;
-        uint32_t gpb = 0xFFFFFFFFu;   /* default = all-released if the read fails (never false-switch) */
-        int mem = open("/dev/mem", O_RDONLY | O_SYNC);
-        if(mem >= 0){
-            void *map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, mem, 0x10010000);
-            if(map != MAP_FAILED){
-                gpb = *(volatile uint32_t *)((char *)map + 0x100);   /* GPB PxPIN (live pin level) */
-                volup = ((gpb >> 13) & 1u) ? 0 : 1;                  /* bit13 low => Vol-Up held */
-                mem_ok = 1;
-                munmap(map, 4096);
-            }
-            close(mem);
-        }
-        /* Persist what the override saw so a failed hand-off is debuggable. GATED behind
-         * /usr/data/volup_dbg so a release image logs nothing by default (no unbounded growth);
-         * create that flag file to enable the diagnostic (e.g. for the cold-boot Vol-Up test). */
+        /* Diagnostic, gated behind /usr/data/volup_dbg so a release image logs nothing by default. */
         FILE *bl = (access("/usr/data/volup_dbg", F_OK) == 0) ? fopen("/usr/data/volup_boot.log", "a") : NULL;
         if(bl){
-            fprintf(bl, "boot flag=%d mem_ok=%d gpb=0x%08x volup=%d boots=%s\n",
-                    flag_stock, mem_ok, gpb, volup, (flag_stock ^ volup) ? "STOCK" : "diskOS");
+            fprintf(bl, "boot select record run_diskos=%d\n", boot_select_is_diskos("/tmp/.diskos_boot_select"));
             fclose(bl);
         }
-        if(flag_stock ^ volup){                      /* effective = default XOR override */
-            char *sa[2]; sa[0]="mq_ui"; sa[1]=NULL;
-            execv("/usr/bin/mq_ui", sa);             /* hand off to stock; fall through to diskOS if exec fails */
-        }
+        boot_select_enforce("/tmp/.diskos_boot_select");
     }
     /* Boot diagnostics: route BOTH stdout and stderr through ONE fd (dup2) so they
      * share a file offset and don't clobber each other; line-buffered so the last
      * step before a crash is flushed. Truncates each launch (boot launch is what
      * we care about; avoids unbounded NAND growth). */
-    freopen("/usr/data/diskos_boot.log", "w", stderr);
+    /* APPEND, so a launcher note written before this point survives; rotate once when it grows past a
+     * cap rather than truncating on every launch (which lost the previous boot AND the launcher's lines). */
+    { struct stat lb; if(stat("/usr/data/diskos_boot.log", &lb) == 0 && lb.st_size > 256*1024)
+          freopen("/usr/data/diskos_boot.log", "w", stderr);
+      else freopen("/usr/data/diskos_boot.log", "a", stderr); }
     dup2(fileno(stderr), fileno(stdout));
     setvbuf(stdout, NULL, _IOLBF, 0);
     setvbuf(stderr, NULL, _IOLBF, 0);
-    diag_sd("mqui: main() entered, boot log open");
     { static char altstk[32768];   /* run the handler on its own stack so a stack-overflow crash can still report */
       stack_t ss; ss.ss_sp = altstk; ss.ss_size = sizeof altstk; ss.ss_flags = 0; sigaltstack(&ss, NULL);
       struct sigaction sa; memset(&sa, 0, sizeof sa);
@@ -1775,12 +2405,21 @@ int main(int argc, char **argv){
      * table (RE 2026-09-05) maps SYSCONFIG.WORK_MODE -> USB gadget: 4=mass-storage EXPORT of the
      * SD, 1=USB-DAC, 0/3/5=Local/no gadget. diskOS previously forced 4 believing it was
      * "LOCALPLAYER", which silently exported the card whenever a cable was attached at boot.
-     * Runtime local AUDIO is asserted separately via 0666+0657 (v240_workmode_cb), so 0 here does
-     * not affect playback. The flashed boot hook also resets this before mq_player launches; this
+     * Runtime local AUDIO is asserted separately via 0666+0657 (localplayer_workmode_cb), so 0 here does
+     * not affect playback. The player launcher independently resets this before stock exec; this
      * is the belt-and-suspenders for hand-deploys. USB-DAC/Storage stay opt-in per session. */
-    { char *a[] = { "sqlite3", "/usr/data/fiio/db/sysconfig.db",
-                    "UPDATE SYSCONFIG SET WORK_MODE=0 WHERE ID=1 AND WORK_MODE IS NOT 0", NULL };
+    { char *a[] = { "sh", "-c",
+                    "[ -f /usr/data/fiio/db/sysconfig.db ] && sqlite3 -cmd '.timeout 3000' /usr/data/fiio/db/sysconfig.db 'UPDATE SYSCONFIG SET WORK_MODE=0 WHERE ID=1 AND WORK_MODE IS NOT 0'", NULL };
       run_bounded(a, 8000);   /* bounded: a locked/corrupt sysconfig.db can't wedge boot */ }
+    /* Confirm the row rather than trusting an UPDATE that may have matched no row.
+     * Unconfirmed -> hold this UI's SD activity for the boot. The player launcher
+     * performs its own fresh reset/read-back instead of trusting a shared marker. */
+    { char *v[] = { "sh", "-c",
+                    "[ -f /usr/data/fiio/db/sysconfig.db ] && [ \"$(sqlite3 -cmd '.timeout 3000' /usr/data/fiio/db/sysconfig.db 'SELECT WORK_MODE FROM SYSCONFIG WHERE ID=1')\" = \"0\" ]", NULL };
+      if(run_bounded(v, 5000) != 0){ g_sd_hold = 1; fprintf(stderr,"WORK_MODE reset UNCONFIRMED -> diskOS SD activity held this boot\n"); fflush(stderr); } }
+    /* SD guard: establish it NOW (before the player is launched 2s after us) so the launcher finds it. If no
+     * guard can exist on this system, hold our SD activity: nothing of ours may keep the card busy. */
+    if(!rmguard_ensure()){ g_sd_hold = 1; fprintf(stderr,"SD guard could NOT be established -> diskOS SD activity held this boot\n"); fflush(stderr); }
     /* Start the SSH server at boot (if installed) so a wedged USB serial can never
      * strand dev access again: dropbear listens once wlan0 gets an address. Harmless
      * if /usr/data/sshd isn't present; start-ssh.sh no-ops if already running. */
@@ -1788,23 +2427,8 @@ int main(int argc, char **argv){
     (void)fw_os_ver();  /* populate fwcaps' static cache on THIS (main) thread before coldplug_start()
                          * creates the worker - pthread_create is a memory barrier, so the worker reads
                          * the already-initialised cache (no first-init data race between the threads). */
-    /* SD-ownership on a UI-ONLY restart: g_sd_writable static-inits to 1 (intended ownership), but if a
-     * previous session handed the card to a USB host and only mq_ui restarted (player + its export still
-     * live), 1 would wrongly re-enable SD writes onto a host-owned card. Seed it from the REAL gadget
-     * state so a restart into an active export starts fail-closed. (sd_write_begin re-checks
-     * sd_exported_to_host() per write; a still-queued-but-not-yet-built export remains a narrow window
-     * that needs V2.40 device qualification to close - documented in the release notes.) Done before
-     * coldplug_start()'s worker (a memory barrier) and before any art write.
-     *
-     * The tmpfs marker also catches the queued-but-not-yet-built export window (sd_exported_to_host() still
-     * false there): present == this boot's player may still have an export pending -> fail closed; absent ==
-     * a reboot cleared it -> writable. An access() error other than ENOENT is treated conservatively as
-     * present. */
-    errno = 0;
-    int have_marker = (access(SD_EXPORT_MARKER, F_OK) == 0);
-    int marker_ambiguous = (!have_marker && errno != ENOENT);   /* not a clean "absent" -> treat as present */
-    if(sd_exported_to_host() || have_marker || marker_ambiguous) atomic_store(&g_sd_writable, 0);
-    coldplug_start();   /* auto-mount the already-inserted microSD at boot (see coldplug_thread) */
+    storage_init();
+    /* coldplug_start() now runs from sd_features_gate_cb, after the launcher publishes its verdict */
     { unsigned seed=0; FILE *r=fopen("/dev/urandom","rb"); if(r){ if(fread(&seed,1,sizeof seed,r)!=sizeof seed) seed=(unsigned)time(NULL); fclose(r);} else seed=(unsigned)time(NULL); srand(seed); }  /* seed RNG (shuffle start pos) */
     lv_init();
     /* /dev/fb0 may not be ready the instant fiio_init launches us at boot; retry. */
@@ -1837,18 +2461,13 @@ int main(int argc, char **argv){
     lv_timer_create(scanner_poll, 500, NULL);            /* apply a finished library rescan */
     if(!books_ensure_migrated())                         /* move any .m4b left in SONG out to BOOKS (upgrade / no-rescan devices) so books never sit in the music queue */
         lv_timer_create(migrate_books_retry_cb, 3000, NULL);   /* failed (transient reader lock) -> retry off the main loop until it succeeds */
-    if(mdb_total_song_count()==0 && !mdb_load_failed()) scanner_start();   /* first run / GENUINELY empty DB -> auto-scan
-                                                                     * (use the TOTAL count, not music-only: an
-                                                                     * audiobook-only library isn't empty and must
-                                                                     * not trigger a rescan every boot); skip on a
-                                                                     * transient DB load error to avoid needless rebuilds */
+    lv_timer_create(sd_features_gate_cb, 500, NULL);     /* start SD-backed features only on a positive launcher verdict */
     g_t_art = lv_timer_create(ui_art_poll, 120, NULL);    /* apply finished album-art decode (worker thread) */
-    lv_timer_create(v240_workmode_cb, 500, NULL);  /* V2.40: solicit a2, settle past the mode-control thread, then set LOCALPLAYER work-mode once */
+    lv_timer_create(localplayer_workmode_cb, 500, NULL);  /* V2.40: solicit a2, settle past the mode-control thread, then set LOCALPLAYER work-mode once */
     /* Background cover/accent prewarm. The worker self-gates on the user's "Album art
      * caching" setting (off/idle/charging) + a battery-temp throttle, so it's safe to
      * always spawn - it just sleeps while disabled or while the player is warm. */
-    ui_start_art_prewarm();
-    albumwall_prewarm_seed();   /* start filling album covers at boot (no Album-view visit required) */
+    /* auto-scan + prewarm now start from sd_features_gate_cb, once the launcher verdict is known */
     /* Try to connect now; if the player's /ui queue isn't up yet (cold boot),
      * keep retrying in the background so the UI still comes up immediately. */
     if(ipc_start()!=0){
@@ -1946,6 +2565,8 @@ int main(int argc, char **argv){
      * IPC connect, etc.). Created earlier, its time-based animation would elapse during that
      * blocking init (the loop isn't ticking yet) and get skipped. Here it animates cleanly in the
      * loop from t=0. It's on lv_layer_top so it covers whatever's already drawn, then reveals it. */
+    if(ui_source_switch_pending()) g_sd_deadline = lv_tick_get() + 20000;
+    lv_timer_create(storage_tick, 100, NULL);
     boot_splash_start();
     /* Init is complete. Force the FIRST FRAME to actually paint (lv_refr_now flushes
      * synchronously on this fb), then disarm the boot watchdog - a painted frame, not
@@ -1953,7 +2574,10 @@ int main(int argc, char **argv){
      * disarming (a blocked write must never leave us alive-but-disarmed), and mask
      * SIGALRM across alarm(0) so an already-pending timer can't fire after we disarm. */
     lv_refr_now(NULL);
-    diag_sd("mqui: reached main loop, first frame painted");
+    if(g_sd_hold){
+        ui_toast("SD protection unavailable - library and artwork are off");
+        lv_timer_create(sd_degraded_notice_cb, 300000, NULL);   /* keep saying so; a toast is missable */
+    }
     { static const char okm[] = "=== diskos reached main loop (first frame painted; boot watchdog disarmed) ===\n";
       (void)write(2, okm, sizeof okm - 1);
       sigset_t as; sigemptyset(&as); sigaddset(&as, SIGALRM);
@@ -1968,7 +2592,7 @@ int main(int argc, char **argv){
             g_settle_armed = 1; g_settle_until = lv_tick_get() + 9000;
             /* A player restart stopped the book (the fresh player is idle) while our session is still set -
              * and a stale book-path in the reconnected state could keep book_tick treating it as playing,
-             * which suppresses the local re-init (v240_workmode_cb bails under an active book) and wedges.
+             * which suppresses the local re-init (localplayer_workmode_cb bails under an active book) and wedges.
              * END the session WITHOUT flushing: the reconnected state can carry the restarted player's
              * shallow replay position (a valid path + fresh seq, but from the NEW instance), and saving that
              * would clobber a deep bookmark. So force g_book_ckpt_ok=0 before the cancel - BOOK_PROGRESS
@@ -2098,7 +2722,8 @@ int main(int argc, char **argv){
             /* V2.40 safety net: a failed local start is most likely NO_WORK_MODE (the one-shot's settle
              * delay wasn't enough, or the player restarted). Re-assert the local-init ONCE so the user's
              * NEXT tap succeeds. Gated Local + analog output; not a retry loop (one send on a real failure). */
-            if(fw_os_ver() == 240 && ui_get_source_mode() == 0 && !g_route_mac[0]){
+            if(fw_needs_localplayer_init() && ui_get_source_mode() == 0 && !g_route_mac[0]
+               && ui_local_playback_allowed()){                /* never re-drive the player once SD is held */
                 ipc_send_cmd("0666000C0006"); ipc_send_cmd("0657000C0008");
             }
         }

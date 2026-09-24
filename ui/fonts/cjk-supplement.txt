@@ -1,0 +1,3 @@
+# Additional Source Han glyphs required by reported music metadata.
+# Keep the existing CJK fallback; this subset fills verified coverage gaps.
+妖帝曼汝珠華衍贈

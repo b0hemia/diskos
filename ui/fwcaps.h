@@ -15,6 +15,13 @@
 /* Stock main-OS version (e.g. 209, 228); 0 if it can't be read. Cached after the first call. */
 int fw_os_ver(void);
 
+/* True for firmware generations whose player needs diskOS's runtime LOCALPLAYER init handshake
+ * (0666 route + 0657 work-mode, sent once per player generation), and separately for those that
+ * need diskOS to mount the SD directly. Both are false for unknown firmware. They are independent
+ * capabilities that currently cover the same firmware set (V2.40 and V2.57). */
+int fw_needs_localplayer_init(void);
+int fw_needs_direct_sd_mount(void);
+
 /* DAC gain-set command tag for the running firmware, or NULL if the firmware is not a verified
  * version (unknown/unreadable) - in which case the caller MUST NOT send a gain command (fail closed;
  * a guessed tag could hit an unrelated handler). V2.09 uses 0645; V2.28 uses 0649 (its 0645 handler

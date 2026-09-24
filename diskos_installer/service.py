@@ -95,7 +95,9 @@ def do_install(params, rep, confirm):
                                    action="pass your official FiiO firmware .zip")
     # Validate the stock image is a genuine, supported, known-good Disc rootfs BEFORE it overwrites
     # the saved recovery copy - so a wrong/corrupt image can't destroy a good recovery then abort.
-    imagebuild.validate_stock_rootfs(stock_sq, rep)
+    # The install policy (INSTALL_FW) is checked here too, for the same reason: refusing an unsupported
+    # firmware must leave the saved recovery image untouched.
+    imagebuild.require_installable(imagebuild.validate_stock_rootfs(stock_sq, rep, allow_override=False))
     _save_stock(stock_sq, rep)
 
     # 2) build the diskOS image

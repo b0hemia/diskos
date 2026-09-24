@@ -1,0 +1,24 @@
+#!/bin/sh
+# diskOS: exit 0 iff this boot's selection record says diskOS, else 1. The ONE shell implementation of the
+# record rule, shipped read-only at /opt/diskos/bin/diskos-selected and used by S97 and the boot hook, so
+# the shell consumers cannot drift apart. main.c's boot_select_is_diskos() applies the identical rule.
+#
+# RULE: the record must be a regular, non-symlink file holding exactly the 7 bytes "diskos\n" (what S96
+# writes). Everything else - missing, symlink, FIFO, device, directory, wrong size, no newline, extra
+# data - means stock. Why each check:
+#  - [ -f ] && [ ! -h ] first, so a FIFO or device at the path is rejected before anything opens it.
+#    This is a check-then-open on a pathname: if the path were REPLACED between the check and the read,
+#    the read could still block or see a different file. The record lives on tmpfs and only root writes
+#    it (S96, once per boot), so that is outside normal operation - main.c's descriptor-based reader has
+#    no such window;
+#  - size exactly 7, because BusyBox ash `read` silently DROPS NUL bytes ("dis\0kos\n" reads as diskos;
+#    verified on the V2.40 BusyBox): with 7 bytes, a newline and a 6-character line there is no room
+#    for a NUL, so this accepts exactly "diskos\n" and nothing else;
+#  - `read` must SUCCEED, i.e. find the newline ("diskos" with no newline is not what S96 writes).
+# The variable exists only so host tests can use a private record; nothing sets it at boot.
+R=${DISKOS_BOOT_SELECT:-/tmp/.diskos_boot_select}
+[ -f "$R" ] && [ ! -h "$R" ] || exit 1
+[ "$(wc -c < "$R" 2>/dev/null)" = 7 ] || exit 1
+l=
+read -r l < "$R" 2>/dev/null || exit 1
+[ "$l" = diskos ]

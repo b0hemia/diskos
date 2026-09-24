@@ -8,7 +8,7 @@
 
 #define MAX_RESULTS 80
 
-static lv_obj_t *g_back;      /* back chevron (lowered off the corner in the empty state) */
+static lv_obj_t *g_back;      /* back chevron, anchored across query states */
 static lv_obj_t *g_bar;       /* the tappable search field */
 static lv_obj_t *g_bar_lbl;   /* the search-bar text (query or placeholder) */
 static lv_obj_t *g_clear;     /* clear-query (X) button, shown only with a query */
@@ -20,17 +20,17 @@ static lv_obj_t *g_results;
 static void search_layout(int active){
     if(active){
         if(g_back) lv_obj_set_pos(g_back, 64, 26);             /* back button: x64..108 */
-        lv_obj_set_size(g_bar, 176, 40);
+        lv_obj_set_size(g_bar, 168, 40);
         lv_obj_align(g_bar, LV_ALIGN_TOP_LEFT, 116, 26);       /* clear of the back button -> no hit-target overlap */
         lv_obj_set_size(g_bar_lbl, 116, 18);                   /* query text, stops before the X */
         lv_obj_set_style_text_align(g_bar_lbl, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_align(g_bar_lbl, LV_ALIGN_LEFT_MID, 14, 0);
-        if(g_clear) lv_obj_set_pos(g_clear, 258, 31);          /* at the pill's right edge (bar 116..292) */
+        if(g_clear) lv_obj_set_pos(g_clear, 248, 31);          /* at the pill's right edge (bar 116..284) */
         if(g_hint) lv_obj_add_flag(g_hint, LV_OBJ_FLAG_HIDDEN);
-        lv_obj_set_pos(g_results, 32, 74); lv_obj_set_size(g_results, 300, 262);
+        lv_obj_set_pos(g_results, 40, 74); lv_obj_set_size(g_results, 280, 248);
         lv_obj_remove_flag(g_results, LV_OBJ_FLAG_HIDDEN);
     } else {
-        if(g_back) lv_obj_set_pos(g_back, 24, 152);            /* left EDGE, in line with the centred pill (mid-row bezel is wide) */
+        if(g_back) lv_obj_set_pos(g_back, 64, 26);            /* shared header position in both empty and result states */
         lv_obj_set_size(g_bar, 150, 40);
         lv_obj_align(g_bar, LV_ALIGN_CENTER, 0, -8);            /* centred; narrow enough that the arrow clears its left edge */
         lv_obj_set_width(g_bar_lbl, LV_SIZE_CONTENT);
@@ -69,7 +69,7 @@ static void rebuild(const char *q){
         const mdb_song_t *s = buf[i];
         lv_obj_t *row = lv_obj_create(g_results);
         lv_obj_remove_style_all(row);
-        lv_obj_set_size(row, 296, 46);
+        lv_obj_set_size(row, 280, 46);
         lv_obj_set_style_radius(row, 8, 0);
         lv_obj_set_style_bg_color(row, lv_color_hex(0x1C1C1E), LV_STATE_PRESSED);
         lv_obj_set_style_bg_opa(row, LV_OPA_70, LV_STATE_PRESSED);
@@ -79,13 +79,13 @@ static void rebuild(const char *q){
         lv_obj_t *t = lv_label_create(row);
         lv_label_set_text(t, s->title[0]?s->title:"Untitled");
         lv_label_set_long_mode(t, LV_LABEL_LONG_DOT);
-        lv_obj_set_pos(t, 12, 5); lv_obj_set_size(t, 268, 19);
+        lv_obj_set_pos(t, 12, 5); lv_obj_set_size(t, 256, 19);
         lv_obj_set_style_text_font(t, ui_font_cjk(16), 0);   /* CJK titles via Source Han Sans fallback */
         lv_obj_set_style_text_color(t, lv_color_hex(0xFFFFFF), 0);
         lv_obj_t *a = lv_label_create(row);
         lv_label_set_text(a, s->artist);
         lv_label_set_long_mode(a, LV_LABEL_LONG_DOT);
-        lv_obj_set_pos(a, 12, 25); lv_obj_set_size(a, 268, 16);
+        lv_obj_set_pos(a, 12, 25); lv_obj_set_size(a, 256, 16);
         lv_obj_set_style_text_font(a, ui_font_cjk(14), 0);
         lv_obj_set_style_text_color(a, lv_color_hex(0xC7C7CC), 0);
     }
@@ -162,7 +162,7 @@ void search_create(lv_obj_t *root){
     lv_obj_remove_style_all(g_clear);
     lv_obj_set_pos(g_clear, 219, 31);      /* inside the centred bar's right edge (bar 105..255) */
     lv_obj_set_size(g_clear, 30, 30);
-    lv_obj_set_ext_click_area(g_clear, 4);
+    lv_obj_set_ext_click_area(g_clear, 7);
     lv_obj_set_style_radius(g_clear, 10, 0);
     lv_obj_set_style_bg_color(g_clear, lv_color_hex(0x2C2C2E), LV_STATE_PRESSED);
     lv_obj_set_style_bg_opa(g_clear, LV_OPA_70, LV_STATE_PRESSED);

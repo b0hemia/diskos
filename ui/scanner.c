@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
+#include "sdio.h"
+#include <stdatomic.h>
 /* First-run / rescan music scanner for diskOS.
  *
  * The stock V2.09 scanner (tag 0622) is a no-op - it never populates song.db from the SD.
@@ -48,8 +50,10 @@ static int g_done;            /* files inserted so far */
 static int g_total;           /* files found (0 until the walk completes) */
 static int g_finished_seq;    /* bumped when a scan finishes (UI edge-detect) */
 static int g_no_sd;           /* last scan aborted because the SD wasn't mounted */
+static _Atomic int g_abort;   /* set from the UI thread to stop a running walk (SD revoked); atomic, not volatile: two threads */
 static int g_scan_err;        /* worker-thread only: any I/O or DB-insert failure during the walk
                                * -> the rebuild is incomplete and must NOT commit over the library */
+static int g_skipped_result; /* completed scan snapshot under g_mu */
 static int g_skipped;         /* files skipped this scan (unstat-able junk / overlong path) - logged, not fatal */
 static int g_unsupported;     /* audio-ish files present but not indexable (AAC/M4A/OGG/...) - drives a UI notice */
 static int g_prune_blocked;   /* an OVERLONG (unknowable) path was skipped -> its row can't be preserved in
@@ -70,6 +74,7 @@ int scanner_take_finished(void){
 }
 /* 1 if the most recent scan did nothing because no SD was mounted (library was kept). */
 int scanner_no_sd(void){ pthread_mutex_lock(&g_mu); int v=g_no_sd; pthread_mutex_unlock(&g_mu); return v; }
+int scanner_skipped(void){ pthread_mutex_lock(&g_mu); int v=g_skipped_result; pthread_mutex_unlock(&g_mu); return v; }
 int scanner_unsupported(void){ pthread_mutex_lock(&g_mu); int v=g_unsupported; pthread_mutex_unlock(&g_mu); return v; }
 
 /* ---- helpers ---- */
@@ -103,7 +108,7 @@ static int is_unsupported_audio(const char *name){
     return has_ext(name,".aac") || has_ext(name,".ogg") || has_ext(name,".oga")
         || has_ext(name,".opus")|| has_ext(name,".ape") || has_ext(name,".dsf") || has_ext(name,".dff")
         || has_ext(name,".aif") || has_ext(name,".aiff")|| has_ext(name,".wma") || has_ext(name,".alac")
-        || has_ext(name,".wv");
+        || has_ext(name,".wv");  /* WavPack: not indexed (unsupported); stock V2.57 also dropped its decoder */
 }
 
 /* ---- text encoding -> UTF-8 (bounded) ---- */
@@ -404,7 +409,7 @@ static void mp4_read(FILE *f, char *title,char *artist,char *album,char *genre,
  * payload+8); every field is bounds-checked against the atom. Start times are 100ns ticks -> ms. Titles
  * are length-prefixed UTF-8 (no NUL), truncated only at a code-point boundary; an empty title becomes
  * "Chapter N". QuickTime chapter-track chapters are NOT read here (a later stage). */
-int scan_read_chapters(const char *path, chapter_t *out, int max){
+static int scan_read_chapters_leased(const char *path, chapter_t *out, int max){
     if(!path || !out || max <= 0) return 0;
     FILE *f = fopen(path, "rb"); if(!f) return 0;
     unsigned char *buf; uint64_t udta_sz; int rerr = 0;
@@ -451,7 +456,7 @@ int scan_read_chapters(const char *path, chapter_t *out, int max){
 /* Read the narrator of an m4b into out[0..cap): the iTunes composer atom (©wrt), the near-universal
  * convention for an audiobook's narrator. Returns 1 if a non-empty value was found. Reuses the udta-only
  * loader + bounded ilst walk. */
-int scan_read_narrator(const char *path, char *out, int cap){
+static int scan_read_narrator_leased(const char *path, char *out, int cap){
     if(!path || !out || cap <= 0) return 0;
     out[0] = 0;
     FILE *f = fopen(path, "rb"); if(!f) return 0;
@@ -701,6 +706,8 @@ static void walk(const char *dir, int depth){
     char path[MAXPATH];
     for(errno=0; (e=readdir(d)); errno=0){    /* errno reset before each readdir so we can detect a read error */
         if(g_scan_err) break;                 /* an earlier write failed (may have auto-rolled-back the txn): stop issuing writes */
+        if(atomic_load(&g_abort)){ g_scan_err = 1; break; }  /* SD access revoked mid-walk: stop reading the card at once
+                                                * (g_scan_err also blocks the commit, keeping the library) */
         if(e->d_name[0]=='.'){
             if(e->d_name[1]==0 || (e->d_name[1]=='.'&&e->d_name[2]==0)) continue;   /* . / .. */
             /* Our OWN app-owned art-cache dir (SCAN_ROOT/.diskos) holds no indexed audio, so it must NOT
@@ -771,6 +778,7 @@ static void *scan_thread(void *arg){
         g_no_sd=1; g_total=0;      /* 0 => library kept; g_no_sd lets the UI say "insert SD" */
         g_active=0; g_finished_seq++;
         pthread_mutex_unlock(&g_mu);
+        sd_io_end();
         return NULL;
     }
     if(sqlite3_open_v2(DB_PATH,&g_db,SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE|SQLITE_OPEN_FULLMUTEX,NULL)==SQLITE_OK){
@@ -860,7 +868,10 @@ static void *scan_thread(void *arg){
                                 "DELETE FROM BOOKS WHERE PATH LIKE '" SCAN_ROOT "/%' AND PATH NOT IN (SELECT PATH FROM seen);",0,0,0)==SQLITE_OK;
                         if(!r) del_ok = 0;   /* relocate failed -> roll back the whole scan */
                     }
-                    if(del_ok) ok = (sqlite3_exec(g_db,"COMMIT;",0,0,0)==SQLITE_OK);
+                    /* A cancellation that lands AFTER the walk (or during the pruning SQL) must still keep the
+                     * library as it was: check again immediately before COMMIT, and roll back instead. */
+                    if(del_ok && !atomic_load(&g_abort)) ok = (sqlite3_exec(g_db,"COMMIT;",0,0,0)==SQLITE_OK);
+                    else ok = 0;
                 }
                 if(!ok) sqlite3_exec(g_db,"ROLLBACK;",0,0,0);
             }
@@ -873,21 +884,30 @@ static void *scan_thread(void *arg){
     }
     sqlite3_close(g_db); g_db=NULL;   /* close even on a failed open: sqlite3_open_v2 may still return a handle */
     pthread_mutex_lock(&g_mu);
+    g_skipped_result = g_skipped;
     g_total = ok ? g_done : 0;    /* committed count; 0 signals a failed rebuild (library kept) */
     g_active=0; g_finished_seq++;
     pthread_mutex_unlock(&g_mu);
-    return NULL;
+    sd_io_end();
+        return NULL;
 }
 
+/* Stop a running walk. The scan holds a single lease for its whole run, so closing admission alone
+ * cannot stop it - without this, revoking SD access left the scanner traversing the card. */
+void scanner_abort(void){ atomic_store(&g_abort, 1); }
 int scanner_start(void){
+    if(!sd_io_begin()) return -1;
     pthread_mutex_lock(&g_mu);
-    if(g_active){ pthread_mutex_unlock(&g_mu); return -1; }   /* already scanning */
-    g_active=1; g_done=0; g_total=0; g_no_sd=0; g_scan_err=0; g_unsupported=0;
+    /* Refuse an overlapping start BEFORE touching the cancellation flag: clearing it first erased a
+     * cancellation aimed at the scan that is already running. */
+    if(g_active){ pthread_mutex_unlock(&g_mu); sd_io_end(); return -1; }   /* already scanning */
+    atomic_store(&g_abort, 0);
+    g_active=1; g_done=0; g_total=0; g_no_sd=0; g_skipped=0; g_skipped_result=0; g_scan_err=0; g_unsupported=0;
     pthread_mutex_unlock(&g_mu);
     pthread_t th;
     if(pthread_create(&th,NULL,scan_thread,NULL)!=0){
         pthread_mutex_lock(&g_mu); g_active=0; pthread_mutex_unlock(&g_mu);
-        return -1;
+        sd_io_end(); return -1;
     }
     pthread_detach(th);
     return 0;
@@ -906,3 +926,17 @@ int main(void){
     return 0;
 }
 #endif
+
+int scan_read_chapters(const char *path, chapter_t *out, int max){
+    if(!sd_io_begin()) return 0;
+    int result = scan_read_chapters_leased(path, out, max);
+    sd_io_end();
+    return result;
+}
+
+int scan_read_narrator(const char *path, char *out, int cap){
+    if(!sd_io_begin()) return 0;
+    int result = scan_read_narrator_leased(path, out, cap);
+    sd_io_end();
+    return result;
+}

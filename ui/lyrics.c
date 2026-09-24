@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
 #include "screens.h"
+#include "sdio.h"
 #include "ipc.h"
 #include "musicdb.h"
 #include <stdio.h>
@@ -153,10 +154,11 @@ static void *lyrics_thread(void *arg)
     g_lbuf[0] = 0;                      /* sole writer until we publish; main reads after the lock */
 
     /* 1) local sibling .lrc FIRST - instant for offline users who sideloaded lyrics (no 12s wait) */
-    if(job->path[0]){
+    if(job->path[0] && sd_io_begin()){
         char lrc[320]; derive_lrc(job->path, lrc, sizeof lrc);
         FILE *f = fopen(lrc, "r");
         if(f){ strip_lrc(f, g_lbuf, sizeof g_lbuf); fclose(f); }
+        sd_io_end();
     }
 
     /* 2) fall back to online (lrclib) by track + artist */

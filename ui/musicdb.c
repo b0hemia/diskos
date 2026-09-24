@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
+#include "sdio.h"
 #include "musicdb.h"
 #include "sqlite3.h"
 #define JSMN_HEADER      /* declarations only; the implementation lives in ipc.c */
@@ -14,6 +15,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 
 #define DB_PATH "/usr/data/fiio/db/song.db"
 
@@ -1186,7 +1188,7 @@ static int pl_export_is_ours(const char *path, const char *name){
     return ok;
 }
 
-int mdb_playlist_export(long pid, const char *name, char *outname, int cap){
+static int mdb_playlist_export_leased(long pid, const char *name, char *outname, int cap){
     if(pid<=0) return 0;
     sqlite3 *d = db(); if(!d) return 0;
     char safe[96]; pl_sanitize(name, safe, sizeof safe);
@@ -1265,6 +1267,12 @@ int mdb_playlist_export(long pid, const char *name, char *outname, int cap){
     /* swap into place only on full success; a failed/partial export leaves any previous good
      * <name>.m3u untouched (writing straight to the real path with "w" would truncate it up front). */
     if(ok && rename(tmp, path) != 0) ok = 0;
+    if(ok){
+        /* fsync the containing directory so the rename entry itself is durable on a non-journaled
+         * card (file data was fsync'd above). Best-effort: an unsupported dir fsync just no-ops. */
+        int dfd = open("/tmp/sdcard", O_RDONLY | O_DIRECTORY);
+        if(dfd >= 0){ fsync(dfd); close(dfd); }
+    }
     if(!ok) remove(tmp);
     sd_write_end();
     if(ok && outname && cap > 0) snprintf(outname, cap, "%s.m3u", base);
@@ -1703,7 +1711,7 @@ static int import_m3u_file(const char *m3u_path){
 }
 /* Scan a directory (one level) for *.m3u / *.m3u8 and import each new one.
  * Returns the number of NEW playlists imported. */
-int mdb_import_m3u_dir(const char *dir){
+static int mdb_import_m3u_dir_leased(const char *dir){
     DIR *d = opendir(dir); if(!d) return 0;
     int total = 0; struct dirent *e;
     while((e = readdir(d))){
@@ -1720,7 +1728,7 @@ int mdb_import_m3u_dir(const char *dir){
 /* Import .m3u/.m3u8 from the SD <root> AND any case-insensitively-named Music / Playlist(s)
  * subdirectory of it (exFAT on Linux is case-sensitive, so "music"/"MUSIC"/"Playlist" all
  * need matching). Returns total playlists imported. */
-int mdb_import_m3u_sd(const char *root){
+static int mdb_import_m3u_sd_leased(const char *root){
     int total = mdb_import_m3u_dir(root);          /* the root itself */
     DIR *d = opendir(root); if(!d) return total;
     struct dirent *e;
@@ -1770,4 +1778,25 @@ int mdb_search(const char *q, const mdb_song_t **out, int cap){
             out[n++] = s;
     }
     return n;
+}
+
+int mdb_import_m3u_dir(const char *dir){
+    if(!sd_io_begin()) return 0;
+    int result = mdb_import_m3u_dir_leased(dir);
+    sd_io_end();
+    return result;
+}
+
+int mdb_import_m3u_sd(const char *root){
+    if(!sd_io_begin()) return 0;
+    int result = mdb_import_m3u_sd_leased(root);
+    sd_io_end();
+    return result;
+}
+
+int mdb_playlist_export(long pid, const char *name, char *outname, int cap){
+    if(!sd_io_begin()) return 0;
+    int result = mdb_playlist_export_leased(pid, name, outname, cap);
+    sd_io_end();
+    return result;
 }

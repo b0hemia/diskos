@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
 #include "screens.h"
+#include "sdio.h"
 #include "folderbrowser.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -83,7 +84,7 @@ static int fb_cmp(const void *a, const void *b){
  * entry, it never aborts the listing. */
 static void fb_fill_stop(void){ if(g_fb_fill){ lv_timer_del(g_fb_fill); g_fb_fill = NULL; } }
 
-static void fb_scan(void){
+static void fb_scan_leased(void){
     fb_fill_stop();                        /* a rescan invalidates any in-flight incremental render */
     g_nent = 0;
     DIR *d = opendir(g_dir);
@@ -136,6 +137,11 @@ static void fb_scan(void){
     if(g_nent > 1) qsort(g_ent, g_nent, sizeof g_ent[0], fb_cmp);
 }
 
+static void fb_scan(void){
+    if(!sd_io_begin()){ fb_fill_stop(); g_nent = 0; return; }
+    fb_scan_leased();
+    sd_io_end();
+}
 static const char *fb_basename(const char *p){
     const char *s = strrchr(p, '/');
     return (s && s[1]) ? s + 1 : p;
@@ -204,12 +210,15 @@ static void fb_rebuild(void){
 
     /* opendir failed at scan time -> either no SD or an unreadable dir. */
     if(g_nent == 0){
-        DIR *probe = opendir(g_dir);
+        int lease = sd_io_begin();
+        DIR *probe = lease ? opendir(g_dir) : NULL;
         if(!probe){
+            if(lease) sd_io_end();
             fb_empty_label(strcmp(g_dir, FB_ROOT) == 0 ? "No SD card" : "Can't open folder");
             return;
         }
         closedir(probe);
+        sd_io_end();
         fb_empty_label("Empty folder");
         return;
     }

@@ -38,10 +38,24 @@ PINNED_ROOTFS = {
 # meanings, so diskOS built on them can send wrong commands and misbehave/reboot.
 # v2.40's 88 MB rootfs needs IMG_SIZE=96 MB + the 768-block writer (see IMG_SIZE note).
 TESTED_FW = {"209", "228", "240"}
+# Firmware diskOS may be INSTALLED on in this release: the three stock versions it supports. Only their exact
+# pinned images are accepted (validate_stock_rootfs(..., allow_override=False) on install/build), and there is no
+# override. V2.57 is pinned for research but NOT supported. TESTED_FW governs validation of saved stock images
+# for restore.
+INSTALL_FW = {"209", "228", "240"}
+
+
+def require_installable(mver):
+    """Refuse to build or install diskOS on any firmware outside INSTALL_FW. No override."""
+    if mver not in INSTALL_FW:
+        raise BuildError(
+            f"firmware MAIN_OS_VER={mver or '?'} is not supported for installing diskOS (supported: "
+            f"{', '.join('V' + v[0] + '.' + v[1:] for v in sorted(INSTALL_FW))}). Restoring stock is still supported.",
+            code="E225")
 SQUASH_MAGIC = b"hsqs"
 
 
-def validate_stock_rootfs(stock_squashfs, rep=None):
+def validate_stock_rootfs(stock_squashfs, rep=None, allow_override=True):
     """Validate that `stock_squashfs` is a genuine, supported, known-good Snowsky Disc rootfs -
     a SHARED gate called BEFORE the image is saved as the recovery copy, BEFORE build, and BEFORE
     every restore-flash (so a wrong-device or crafted rootfs can never be saved or flashed on the
@@ -73,14 +87,17 @@ def validate_stock_rootfs(stock_squashfs, rep=None):
         mver = _grep1(ver_in, r"MAIN_OS_VER=([0-9]+)")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
-    override = os.environ.get("DISKOS_ALLOW_UNTESTED_FW") == "1"
+    # allow_override=False (install/build of this release): the pin is absolute - the override may only ever
+    # relax validation of a saved stock image being RESTORED, never what diskOS gets built on or installed onto.
+    override = allow_override and os.environ.get("DISKOS_ALLOW_UNTESTED_FW") == "1"
     if prod != "SNOWSKY_DISC":
         raise BuildError(f"not a Snowsky Disc rootfs (PRODUCT={prod!r})", code="E220")
     if mver not in TESTED_FW and not override:
         raise BuildError(
             f"firmware MAIN_OS_VER={mver or '?'} is not tested (supported: {', '.join(sorted(TESTED_FW))}). "
-            "Other versions can have incompatible command meanings. Re-run with "
-            "DISKOS_ALLOW_UNTESTED_FW=1 at your own risk.", code="E221")
+            "Other versions can have incompatible command meanings."
+            + (" Re-run with DISKOS_ALLOW_UNTESTED_FW=1 at your own risk." if allow_override else ""),
+            code="E221")
     pin = PINNED_ROOTFS.get(mver)
     if pin:
         exp_sha, exp_sz = pin
@@ -114,8 +131,9 @@ def validate_stock_rootfs(stock_squashfs, rep=None):
                 raise BuildError(
                     f"stock rootfs does not match the known-good V{mver} image (got "
                     f"{(got_sha or 'short/oversize')[:12]}..., expected {exp_sha[:12]}...). The firmware "
-                    "may be modified, corrupt, or repackaged - re-download the official FiiO firmware. "
-                    "(Set DISKOS_ALLOW_UNTESTED_FW=1 at your own risk.)", code="E224")
+                    "may be modified, corrupt, or repackaged - re-download the official FiiO firmware."
+                    + (" (Set DISKOS_ALLOW_UNTESTED_FW=1 at your own risk.)" if allow_override else ""),
+                    code="E224")
         else:
             rep.log(f"stock rootfs matches the pinned known-good V{mver} image (sha256 verified)")
     elif mver in TESTED_FW:
@@ -302,24 +320,158 @@ def _copyfile(src, dst):
 # --- fiio_init.sh boot-hook patch (python-native, single-match-or-refuse) ----
 _OLD_IF = 'if [ "$COREDUMP_FLAG" == "1" ]; then'
 _LAUNCH = _OLD_IF + "\n    /usr/data/mq_ui &"
+_GUARD_PATH_LINE = "export PATH=/opt/diskos/bin:$PATH"
+# S96 writes exactly "diskos\n" or "stock\n". Only a POSITIVE record launches diskOS: missing, partial or
+# malformed (selector hung, crashed, timed out or never ran) means stock. The record is read ONLY through
+# the shared helper (payload/diskos-selected), which rejects a non-regular file before opening it, so a FIFO
+# at the path cannot block the boot hook (short of the path being swapped between its check and its read);
+# if the helper itself is missing the test fails, which is stock.
+_SELECTED_HELPER = "/opt/diskos/bin/diskos-selected"
+_BOOTPROBE = "/opt/diskos/bin/diskos-bootprobe"
+_SELECT_LINE = _SELECTED_HELPER
+# (image path, payload name) of every file the boot's stock/diskOS decision runs through
+_BOOT_DECISION_FILES = (
+    ("etc/init.d/S96diskos_select", "S96diskos_select"),
+    ("etc/init.d/S97diskos_install", "S97diskos_install"),
+    (_SELECTED_HELPER.lstrip("/"), "diskos-selected"),
+    (_BOOTPROBE.lstrip("/"), "diskos-bootprobe"),
+)
 _BLOCK = (
-    "if [ -f /usr/data/mq_ui ] && [ -f /usr/data/mq_player ]; then\n"
+    "# diskOS SD guard: the stock player runs 'umount /tmp/sdcard; rm -rf /tmp/sdcard' without checking\n"
+    "# the umount; on a busy (mounted) card that empties the card. /opt/diskos/bin/rm refuses card\n"
+    "# operands. Exported HERE (before any launch) so the initial launch, BOTH watchdog respawn\n"
+    "# branches and the stock fallback all inherit it.\n"
+    + _GUARD_PATH_LINE + "\n"
+    "# READINESS GATE: /tmp/.diskos_ready is written by S97 only when it COMPLETED and left a verified\n"
+    "# override in place. It is on tmpfs, so it means 'this boot'. Requiring it means a first-boot hook\n"
+    "# that hung, was killed, or could not quarantine a bad install falls back to STOCK - the decision no\n"
+    "# longer depends on S97 having successfully deleted anything from NAND.\n"
+    "# STOCK SELECTION: S96 sampled the boot preference and the Vol-Up override once, before any diskOS\n"
+    "# code ran, and recorded the result. Only a positive 'diskos' record launches diskOS, so reaching the\n"
+    "# stock firmware never depends on diskOS - or on the selector itself - completing.\n"
+    "if " + _SELECT_LINE + " && [ -f /tmp/.diskos_ready ] && [ -f /usr/data/mq_ui ] && [ -f /usr/data/mq_player ]; then\n"
     "    # diskOS override: run our UI + the player from /usr/data (persists across\n"
     "    # rootfs flashes).  Falls back to the stock rootfs binaries if either is absent.\n"
     "    /usr/data/mq_ui &\n    sleep 2\n    /usr/data/mq_player &\n"
-    'elif [ "$COREDUMP_FLAG" == "1" ]; then'
+    # The stock hook has a SECOND launch site: when its coredump flag is set it runs the /usr/data
+    # binaries directly. On a diskOS device those are ours, so that branch was a way to launch diskOS
+    # with the readiness gate bypassed entirely. It keeps its original meaning (launch from /usr/data)
+    # but only when readiness says so; otherwise it falls through to the bare names, which are stock.
+    'elif ' + _SELECT_LINE + ' && [ -f /tmp/.diskos_ready ] && [ "$COREDUMP_FLAG" == "1" ]; then'
 )
 
 
+# The pristine stock fiio_init.sh the boot-hook patch was designed and tested against, hashed as RAW BYTES.
+# It is byte-identical on V1.95, V2.09 (from the pin-verified stock image), V2.28, V2.40 and V2.57. Any
+# other script is refused outright - there is no override for this one - because the patch's safety rests
+# on the script's exact structure, and no text heuristic can establish shell control flow (the previous
+# heuristic was bypassed three different ways). A new firmware with a different script needs its own
+# reviewed entry here.
+KNOWN_FIIO_INIT_SHA256 = {"ad8455ad0a3d9577260419a06ad2e0802c24bc6bb8e9ed4b64637b7bd968ccf2"}
+
+# The only forms in which a patched script may mention the diskOS (/usr/data) binaries, after strip().
+_USR_DATA_ALLOWED = (
+    'PROCESS_MQ_UI="/usr/data/mq_ui"',
+    'PROCESS_MQ_PLAYER="/usr/data/mq_player"',
+    '/usr/data/mq_ui &',
+    '/usr/data/mq_player &',
+)
+
+
+def _validate_boot_hook(fi):
+    """Sanity-check a PATCHED fiio_init.sh (bytes or str). Raises BuildError (E232).
+
+    This is NOT the safety proof and does not claim to establish shell control flow. The guarantee is:
+    _patch_fiio_init only ever patches the one pinned stock script (KNOWN_FIIO_INIT_SHA256, raw bytes), and
+    the output image must contain exactly the bytes that patch produced (checked by the caller). These
+    checks catch gross corruption early and with a readable message: strict UTF-8, no carriage returns,
+    exactly one patch, the SD-guard PATH export first, the generated block intact, and no mention of the
+    /usr/data binaries outside the known forms or outside a gated condition.
+    """
+    def bad(msg):
+        raise BuildError("repacked image: fiio_init.sh " + msg + " - do NOT flash", code="E232")
+    if isinstance(fi, (bytes, bytearray)):
+        try:
+            fi = bytes(fi).decode("utf-8")
+        except UnicodeDecodeError:
+            bad("is not valid UTF-8")
+    # A lone CR is invisible to line-splitting tools but not to the shell: it can fold a following
+    # command into a comment. The known script has none, so any CR is corruption.
+    if "\r" in fi:
+        bad("contains a carriage return")
+    if fi.count("diskOS override") != 1:
+        bad("does not contain exactly one diskOS boot-hook patch")
+    g = fi.find(_GUARD_PATH_LINE)
+    if g < 0 or g > fi.find("diskOS override"):
+        bad("lacks the SD-guard PATH export before the launch block")
+    if fi.count(_BLOCK + "\n    /usr/data/mq_ui &") != 1:
+        bad("does not contain the generated launch block followed by the branch it replaced")
+    lines = fi.splitlines()
+    for i, ln in enumerate(lines):
+        st = ln.strip()
+        if st.startswith("#") or ("/usr/data/mq_ui" not in st and "/usr/data/mq_player" not in st):
+            continue
+        if st in _USR_DATA_ALLOWED:
+            continue
+        if st.startswith("if " + _SELECT_LINE + " && [ -f /tmp/.diskos_ready ] && [ -f /usr/data/mq_ui ]"):
+            continue
+        bad(f"line {i + 1} mentions the /usr/data binaries in an unrecognised form: {st[:80]!r}")
+    launches = 0
+    for i, ln in enumerate(lines):
+        st = ln.strip()
+        if st.startswith("#") or not (st.startswith("/usr/data/mq_ui") or st.startswith("/usr/data/mq_player")):
+            continue
+        launches += 1
+        cond = None
+        for j in range(i - 1, -1, -1):
+            pj = lines[j].strip()
+            if pj.startswith("if ") or pj.startswith("elif "):
+                cond = pj
+                break
+            if pj in ("else", "fi") or pj.startswith("else "):
+                break          # the nearest enclosing test is not a positive condition
+        if cond is None or _SELECT_LINE not in cond or "[ -f /tmp/.diskos_ready ]" not in cond:
+            bad(f"line {i + 1} launches /usr/data binaries without the stock selection and readiness "
+                f"gate in its own condition")
+    if launches < 2:
+        bad("has no gated /usr/data launch (unexpected structure)")
+
+
+def _check_decision_file(path, payload_path, name):
+    """One boot-decision file in the output image: a regular file (lstat - never a symlink), permission
+    bits EXACTLY 0755 (S_IMODE: no setuid/setgid/sticky either), and byte-identical to the payload."""
+    import stat as _st
+    m = os.lstat(path).st_mode
+    if not _st.S_ISREG(m) or _st.S_IMODE(m) != 0o755:
+        raise BuildError(f"repacked image: {name} is not a regular 0755 file (mode {oct(m)}) - do NOT flash",
+                         code="E232")
+    with open(path, "rb") as a, open(payload_path, "rb") as b:
+        if a.read() != b.read():
+            raise BuildError(f"repacked image: {name} differs from the shipped payload - do NOT flash", code="E232")
+
+
+def _check_boot_script_output(actual, expected):
+    """The output-image check for the boot script, on RAW BYTES: sanity checks, then exact equality with
+    the bytes the build wrote (which _patch_fiio_init only ever derives from the one pinned script)."""
+    _validate_boot_hook(actual)
+    if actual != expected:
+        raise BuildError("repacked image: fiio_init.sh differs from the patched script the build wrote - "
+                         "do NOT flash", code="E232")
+
+
 def _patch_fiio_init(path, rep):
-    with open(path, encoding="utf-8", errors="surrogateescape") as f:
-        s = f.read()
-    # We always start from freshly-extracted OFFICIAL stock, so the file must be
-    # UNpatched: refuse anything already containing our marker (corrupt/re-used tree)
-    # rather than trusting it.
-    if "diskOS override" in s:
-        raise BuildError("fiio_init.sh already contains a diskOS marker - refusing to "
-                         "patch a non-pristine rootfs. Re-extract from official firmware.", code="E223")
+    """Patch the stock boot script. Works on RAW BYTES end to end, so no newline translation or decoding
+    leniency can make the hashed, patched or written bytes differ from what is checked."""
+    import hashlib
+    with open(path, "rb") as f:
+        raw = f.read()
+    sha = hashlib.sha256(raw).hexdigest()
+    if sha not in KNOWN_FIIO_INIT_SHA256:
+        raise BuildError(f"fiio_init.sh (sha256 {sha[:12]}...) is not the stock boot script the diskOS boot "
+                         "hook was built and tested against - refusing to patch this firmware.", code="E223")
+    s = raw.decode("utf-8")       # the known script is valid UTF-8; strict, never lossy
+    if "diskOS override" in s:    # cannot happen for the known hash; kept as a belt-and-braces refusal
+        raise BuildError("fiio_init.sh already contains a diskOS marker - refusing to patch it again.", code="E223")
     n = s.count(_LAUNCH)
     if n != 1:
         raise BuildError(
@@ -328,8 +480,57 @@ def _patch_fiio_init(path, rep):
             "incompatible firmware boot structure; do not ship this base untested.", code="E223")
     i = s.index(_LAUNCH)
     s = s[:i] + _BLOCK + s[i + len(_OLD_IF):]
-    with open(path, "w", encoding="utf-8", errors="surrogateescape") as f:
-        f.write(s)
+    with open(path, "wb") as f:
+        f.write(s.encode("utf-8"))
+
+
+def _install_sd_guards(rf):
+    """Replace the stock rm entry, never its BusyBox target or an outside path."""
+    import hashlib, stat
+    from pathlib import Path
+    bindir = os.path.join(rf, "bin")
+    _assert_within_rf(rf, bindir)
+    busybox = os.path.join(bindir, "busybox")
+    _assert_within_rf(rf, busybox)
+    if not stat.S_ISREG(os.lstat(busybox).st_mode):
+        raise BuildError("stock /bin/busybox is not a regular file", code="E233")
+    before = hashlib.sha256(Path(busybox).read_bytes()).hexdigest()
+    dst = os.path.join(bindir, "rm")
+    # Validate the parent first, then unlink the directory entry itself. In
+    # particular an absolute /bin/busybox symlink must never resolve on the host.
+    if os.path.lexists(dst):
+        if stat.S_ISDIR(os.lstat(dst).st_mode):
+            raise BuildError("stock /bin/rm is a directory", code="E233")
+        os.unlink(dst)
+    src = bundle.data("diskos-rmguard")
+    _install(src, dst, 0o755, rf)
+    _install(src, os.path.join(rf, "opt/diskos/bin/rm"), 0o755, rf)
+    if hashlib.sha256(Path(busybox).read_bytes()).hexdigest() != before:
+        raise BuildError("BusyBox changed while installing the SD guard", code="E233")
+    return before
+
+
+def _validate_sd_guards(rf, expected_busybox_sha=None):
+    import hashlib, stat
+    from pathlib import Path
+    expected = Path(bundle.data("diskos-rmguard")).read_bytes()
+    for rel in ("bin/rm", "opt/diskos/bin/rm"):
+        path = os.path.join(rf, rel)
+        _assert_within_rf(rf, path, code="E232")
+        try:
+            mode = os.lstat(path).st_mode
+            if not stat.S_ISREG(mode) or not mode & 0o111:
+                raise OSError("not an executable regular file")
+            if Path(path).read_bytes() != expected:
+                raise OSError("content mismatch")
+        except OSError as exc:
+            raise BuildError(f"repacked image: invalid SD guard {rel}: {exc} - do NOT flash", code="E232") from exc
+    if expected_busybox_sha is not None:
+        path = os.path.join(rf, "bin/busybox")
+        _assert_within_rf(rf, path, code="E232")
+        if (not stat.S_ISREG(os.lstat(path).st_mode)
+                or hashlib.sha256(Path(path).read_bytes()).hexdigest() != expected_busybox_sha):
+            raise BuildError("repacked image: BusyBox differs from stock - do NOT flash", code="E232")
 
 
 # --- ELF sanity for the UI binary -------------------------------------------
@@ -558,7 +759,8 @@ def _case_sensitive_extract_root(workdir, rep):
                 pass
 
 
-def _validate_squashfs_output(sq_path, unsq, expect_ui_sha, expect_ui_sz, extract_root, rep=None):
+def _validate_squashfs_output(sq_path, unsq, expect_ui_sha, expect_ui_sz, extract_root, rep=None, expected_busybox_sha=None,
+                              expected_fiio_init=None):
     """Validate a freshly-repacked squashfs by its CONTENT, not the repacker's exit status. Does a
     COMPLETE independent extraction (so silent corruption ANYWHERE fails, not just in two files),
     then verifies every boot-critical artefact: the boot-hook patch in fiio_init.sh, the executable
@@ -590,9 +792,20 @@ def _validate_squashfs_output(sq_path, unsq, expect_ui_sha, expect_ui_sz, extrac
             return p
 
         # boot hook present + patched
-        with open(_need("usr/project/fiio_init.sh", "boot script"), encoding="utf-8", errors="ignore") as f:
-            if "diskOS override" not in f.read():
-                raise BuildError("repacked image: fiio_init.sh lacks the diskOS boot-hook patch", code="E232")
+        with open(_need("usr/project/fiio_init.sh", "boot script"), "rb") as f:
+            fi = f.read()                 # RAW bytes: no newline translation, no lossy decoding
+        if expected_fiio_init is None:
+            raise BuildError("internal: output validation needs the patched boot script bytes", code="E232")
+        _check_boot_script_output(fi, expected_fiio_init)
+        sel = _need("etc/init.d/S96diskos_select", "boot selector")
+        if not (os.stat(sel).st_mode & 0o111):
+            raise BuildError("repacked image: S96diskos_select is not executable", code="E232")
+        # exact identity, not just existence: the boot-time scripts are what decide stock vs diskOS
+        # every file the stock/diskOS decision runs through: exact bytes, a regular file (not a symlink),
+        # and permission bits exactly 0755 - a non-executable helper would silently force every boot to stock
+        for rel, name in _BOOT_DECISION_FILES:
+            _check_decision_file(_need(rel, name), bundle.data(name), name)
+        _validate_sd_guards(dst, expected_busybox_sha)
         # first-boot installer hook present + executable
         s97 = _need("etc/init.d/S97diskos_install", "first-boot installer hook")
         if not (os.stat(s97).st_mode & 0o111):
@@ -640,7 +853,7 @@ def build_image(stock_squashfs, ui_binary, variant, out_bin, workdir, rep=None):
             raise BuildError(f"unsquashfs failed: {r.stderr.strip()[:400]}", code="E230")
 
         rep.status("[2/6] validating base is a Snowsky Disc rootfs")
-        validate_stock_rootfs(stock_squashfs, rep)   # product / tested-version / known-good-hash gate
+        require_installable(validate_stock_rootfs(stock_squashfs, rep, allow_override=False))   # exact pin, then policy
 
         rep.status("[3/6] validating the diskOS UI binary")
         _validate_ui_elf(ui_binary)
@@ -649,7 +862,18 @@ def build_image(stock_squashfs, ui_binary, variant, out_bin, workdir, rep=None):
         fiio_path = os.path.join(rf, "usr/project/fiio_init.sh")
         _assert_within_rf(rf, fiio_path)          # a crafted rootfs must not redirect the in-place patch
         _patch_fiio_init(fiio_path, rep)
+        with open(fiio_path, "rb") as f:
+            patched_fiio_init = f.read()
+        # Runs before S97 so the stock choice is made ahead of any diskOS installation work.
+        _install(bundle.data("S96diskos_select"), os.path.join(rf, "etc/init.d/S96diskos_select"), 0o755, rf)
         _install(bundle.data("S97diskos_install"), os.path.join(rf, "etc/init.d/S97diskos_install"), 0o755, rf)
+        # the one shell reader of the boot-selection record, used by S97 and by the boot hook
+        _install(bundle.data("diskos-selected"), os.path.join(rf, _SELECTED_HELPER.lstrip("/")), 0o755, rf)
+        # S96's bounded native probe: errno-aware preference lookup + pin read, under its own supervisor
+        _install(bundle.data("diskos-bootprobe"), os.path.join(rf, _BOOTPROBE.lstrip("/")), 0o755, rf)
+        # Guard the actual /bin entry too: default PATH and stock fallbacks must
+        # remain protected even when the custom UI/NAND override is unavailable.
+        busybox_sha = _install_sd_guards(rf)
 
         import hashlib
         ui_sha = hashlib.sha256(open(ui_binary, "rb").read()).hexdigest()
@@ -698,7 +922,8 @@ def build_image(stock_squashfs, ui_binary, variant, out_bin, workdir, rep=None):
         # embedded UI extracts byte-identical (an independent unsquashfs round-trip). Catches a
         # silently-corrupt/truncated repack - the exact failure mode a nonzero-exit-but-valid (or, worse,
         # zero-exit-but-corrupt) mksquashfs could hide - before it ever reaches the device.
-        _validate_squashfs_output(out_sq, unsq, ui_sha, ui_sz, extract_root, rep)
+        _validate_squashfs_output(out_sq, unsq, ui_sha, ui_sz, extract_root, rep, busybox_sha,
+                                  expected_fiio_init=patched_fiio_init)
 
         rep.status("[6/6] finalizing image (pad to partition size)")
         _copyfile(out_sq, out_bin)

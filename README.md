@@ -42,23 +42,25 @@ on-device UI source lives in [`ui/`](ui/) and is licensed separately under **GPL
 artifact, `payload/mq_ui`, is what the installer bakes into the image); see [License](#license) for
 the boundary.
 
-**v1.1.1 fixes image builds on the default macOS filesystem** by automatically using a temporary
-case-sensitive volume. Device flashing from macOS remains unverified end to end.
+**v1.1.3 is a safety release.** It protects the microSD card against a deletion flaw in the stock
+player that diskOS runs alongside, and reworks how diskOS hands the card to USB Storage. It also
+includes Bluetooth, font, and interface fixes. **Every diskOS user should update.** Updating needs
+the complete installer and a new flash; replacing only the UI binary does not install the protection.
 
-This builds on v1.1.0's V2.40 firmware support and refreshed listening interface: album cover flow,
-a separate Books view with saved progress, folder browsing, Latin-extended, Greek, and Cyrillic
-library text, and safer selection of USER EQ presets changed on the stock player.
+It builds on earlier releases: V2.40 firmware support, album cover flow, a separate Books view with
+saved progress, folder browsing, Latin-extended, Greek, and Cyrillic library text, safer selection of
+USER EQ presets changed on the stock player, and image builds on the default macOS filesystem.
 
 ## At a glance
 
 | | |
 |---|---|
 | **Device** | FiiO Snowsky Disc |
-| **Current release** | v1.1.1 |
+| **Current release** | v1.1.3 |
 | **Project status** | Beta; field testing is still limited |
 | **Released host** | Linux x86-64 |
 | **macOS** | Image builds tested on the default filesystem; device flashing remains unverified |
-| **Flash-tested stock firmware** | V2.09, V2.28, and V2.40 |
+| **Supported stock firmware** | V2.09, V2.28, and V2.40 |
 | **Typical flash time** | About 15 minutes, including verification |
 | **Return to stock** | Saved-image restore, temporary stock boot, or stock UI as default |
 
@@ -190,8 +192,10 @@ Useful recovery and cleanup commands:
 `restore-stock` acts on the player. `remove` cleans up the installer's files on the host, including
 saved recovery files; restore first if needed and keep a separate copy of your saved stock image.
 
-Updating diskOS also requires a flash. Use the complete v1.1.1 installer and its matching flash
-tools, supply your official firmware archive, and follow the same installation steps.
+Updating diskOS also requires a flash. Use the complete v1.1.3 installer and its matching flash
+tools, supply your official firmware archive, and follow the same installation steps. Back up the
+card and keep your saved stock image first. The installer accepts only the unmodified official
+V2.09, V2.28, and V2.40 firmware; modified images and V2.57 are refused.
 
 ## Requirements
 
@@ -217,7 +221,7 @@ The build, save, and flash then run as one unprivileged process.
 
 ### Host support
 
-- **Linux x86-64:** released and tested end to end on hardware with V2.09, V2.28, and V2.40.
+- **Linux x86-64:** released and tested end to end on hardware.
 - **macOS, Apple Silicon and Intel:** a build-from-source path is available through
   `build/build-macos.sh` after installing libusb with Homebrew. **Image builds now succeed on the
   default case-insensitive macOS filesystem.** The installer automatically creates and mounts a
@@ -247,7 +251,10 @@ storage.
 You can also switch without reflashing:
 
 - **Persistently:** Settings > System > Default UI > Stock
-- **Once:** hold **Volume Up** during power-on
+- **Once:** hold **Volume Up** from power-on until the other UI appears
+
+Both keep the diskOS delete guard, because the diskOS image stays installed. Restoring the saved
+stock image removes the guard.
 
 If a flash fails, the root filesystem can be left partially written. In tested cases, the device
 could be returned to mask-ROM mode by powering off, holding **Volume Down**, and reconnecting USB,
@@ -260,10 +267,10 @@ flashed code runs, but recovery is still **not guaranteed** for every unit or fa
 |---|---|---|
 | Tested | Flash mechanism and image build | Used on real hardware; writer skips factory bad blocks and verifies every block |
 | Tested | Firmware extraction | Reproduces the stock root filesystem byte for byte from FiiO's archive |
-| Tested | Linux x86-64 | Builds and flashes end to end on hardware with V2.09, V2.28, and V2.40 |
+| Tested | Linux x86-64 | Builds and flashes end to end on hardware |
 | Tested | macOS image builds | Builds succeed on the default case-insensitive filesystem; case-colliding stock files coexist |
 | Unverified | macOS device flashing | No end-to-end flash with a device attached to a Mac yet |
-| Limited | Firmware coverage | V2.09, V2.28, and V2.40 are flash-tested; other versions are refused by default |
+| Supported | Firmware | V2.09, V2.28, and V2.40; other versions are refused |
 
 Local music playback is the well-tested listening path. Weather and Last.fm remain experimental;
 hardware flash testing does not imply that every feature or mode has been verified.
@@ -274,24 +281,26 @@ leave the device mask-ROM-recoverable instead of continuing. Wide field testing 
 
 ## Known issues
 
-- **Firmware coverage:** only V2.09, V2.28, and V2.40 are currently flash-tested. Other command maps can
-  differ and are refused by default.
-- **macOS flashing:** image builds are tested, but device flashing from a Mac remains unverified.
-- **Long flash:** a complete write and verification takes about 15 minutes. Most of the time is
-  a conservative fixed wait; a faster writer is planned.
-- **No on-device update path:** updating diskOS currently requires another flash.
-- **microSD after cold boot:** the card mounts a few seconds after startup. If the library initially
-  appears empty, reinsert the card once.
+- **V2.57:** not supported; the installer refuses it.
+- **Library scans:** the hardware buttons can stop responding while a scan runs (touch still works).
+  They come back when the scan finishes. USB Storage is refused while a scan is running.
+- **Boot override:** hold **Volume Up** from power-on until the other UI appears. A short hold can
+  be missed.
+- **Restart:** temporarily removed from Settings until it can wait for card writes to finish.
+- **Debug Mode:** the public image offers SSH over Wi-Fi only; the USB serial shell is for
+  developer builds.
+- **USB Storage:** always eject safely on the computer before switching back to Local. If diskOS
+  cannot confirm who owns the card, it keeps its card features off and asks for a reboot.
+- **Card after cold boot:** the card mounts a few seconds after startup. If diskOS reports that card
+  access is unavailable, its library and artwork stay off for that boot.
 - **Cover flow artwork:** albums without cached art show placeholders. Playing a track with artwork
-  lets diskOS populate its art cache.
+  lets diskOS fill its art cache.
 - **Folder playback:** a selected file must be in the library database. Unindexed files report
   "Not in library". Playback uses the all-songs queue, not a folder-only queue.
-- **Lightly tested modes:** USB DAC, Bluetooth receiver, and USB storage have less coverage than
-  local playback.
-- **USB-serial debug:** the dev variant's CDC-ACM serial shell can be unreliable. Prefer temporary
-  SSH over Wi-Fi.
-- **Last.fm:** scrobbling is experimental and has not completed a live end-to-end verification.
-  Setup transfers your API key over your local network in plaintext HTTP. It is off by default; read
+- **Long flash:** a complete write and verification takes about 15 minutes. Updating diskOS
+  requires another flash.
+- **Last.fm:** scrobbling is experimental. Setup transfers your API key over your local network in
+  plaintext HTTP. It is off by default; read
   [`docs/PRIVACY.md`](docs/PRIVACY.md) first.
 
 Found another issue? Open a GitHub issue and include the device's **firmware version** and the exact
@@ -416,7 +425,7 @@ written even when the writer fails closed.
 | E123 / E124 | Writer capacity cannot be verified or is too small; refused before any NAND write |
 | E140-E142 | Firmware ZIP, saved stock image, or state-directory problem |
 | **E2xx** | Firmware extraction and image build |
-| E201-E224 | Unsafe archive, OTA manifest, decrypt, rootfs, version, payload, or hash problem |
+| E201-E225 | Unsafe archive, OTA manifest, decrypt, rootfs, version, payload, or hash problem. E221/E224/E225 mean the firmware is not an unmodified supported version; install and build cannot override them |
 | E230-E250 | Squashfs extraction/build, size, validation, filesystem, symlink, partition, or variant problem |
 | E234 | Build filesystem could not be verified as case-sensitive, or scratch-volume setup failed; see the accompanying message |
 | **E3xx** | Host-side flashing |

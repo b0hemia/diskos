@@ -9,6 +9,9 @@
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
 
 /* Bluetooth settings (SCR_BT) + a details screen (SCR_BT_INFO).
  * The BT chip (BCM43438 / AP6212, 2.4GHz-only) sits on UART /dev/ttyS0. RE of the
@@ -63,6 +66,71 @@ static int run_cap(const char *cmd, char *out, int cap){
     return n;
 }
 
+/* Children run_cap_bounded killed but could not reap within its bound (e.g. stuck in uninterruptible
+ * sleep). They stay unreaped - so their pids stay ours - and are retried, never waited on, by later calls.
+ * Main thread only (both callers run on LVGL timers), so no lock. */
+#define BT_STUCK_MAX 8
+static pid_t g_bt_stuck[BT_STUCK_MAX];
+
+static void bt_reap_stuck(void){
+    for(int i = 0; i < BT_STUCK_MAX; i++)
+        if(g_bt_stuck[i] > 0 && waitpid(g_bt_stuck[i], NULL, WNOHANG) != 0) g_bt_stuck[i] = 0;
+}
+
+/* Like run_cap, but the child runs in its OWN process group and is HARD-KILLED after `timeout_ms`, so a
+ * wedged bluetoothd/bluealsa can never hang the UI thread. The device has NO `timeout` binary, so we
+ * bound it in C. Returns bytes captured (0 on failure/timeout). Used for the periodic BT state/route
+ * probes that run on LVGL timers (the main thread).
+ * Every step is bounded: the group is established from BOTH sides of the fork (so it exists before the
+ * parent can signal it), the direct child is killed as well as its group, and reaping is non-blocking
+ * with a short cap - a child that will not die is parked in g_bt_stuck instead of blocking the UI. */
+static int run_cap_bounded(const char *cmd, char *out, int cap, int timeout_ms){
+    out[0] = 0;
+    if(cap < 1) return 0;
+    bt_reap_stuck();
+    int slot = -1;
+    for(int i = 0; i < BT_STUCK_MAX; i++) if(g_bt_stuck[i] <= 0){ slot = i; break; }
+    if(slot < 0) return 0;                     /* too many unkillable probes already: do not add another */
+    int fds[2];
+    if(pipe(fds) != 0) return 0;
+    pid_t pid = fork();
+    if(pid < 0){ close(fds[0]); close(fds[1]); return 0; }
+    if(pid == 0){                              /* child: stdout -> pipe; own group for kill(-pid) */
+        close(fds[0]);
+        dup2(fds[1], 1);
+        close(fds[1]);
+        if(setpgid(0, 0) != 0 && getpgrp() != getpid()) _exit(126);
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    setpgid(pid, pid);                         /* parent side too: the group exists before we go on */
+    close(fds[1]);
+    int n = 0;
+    uint32_t start = lv_tick_get();
+    for(;;){
+        int left = timeout_ms - (int)lv_tick_elaps(start);
+        if(left <= 0) break;                   /* deadline hit */
+        struct pollfd pf = { fds[0], POLLIN, 0 };
+        int pr = poll(&pf, 1, left);
+        if(pr <= 0) break;                     /* timeout or poll error */
+        int r = read(fds[0], out + n, cap - 1 - n);
+        if(r <= 0) break;                      /* EOF or read error */
+        n += r;
+        if(n >= cap - 1) break;
+    }
+    out[n] = 0;
+    close(fds[0]);
+    /* The child is unreaped, so pid and its group are still ours: kill both, whatever happened. */
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+    for(int i = 0; i < 20; i++){               /* bounded reap: at most ~100 ms */
+        if(waitpid(pid, NULL, WNOHANG) != 0) return n;
+        usleep(5000);
+    }
+    g_bt_stuck[slot] = pid;                    /* stuck in the kernel: retry later, never block on it */
+    return n;
+}
+
 /* a single status message (Scanning / off / empty) - centered in the list area */
 static void list_msg(const char *m){
     if(!g_list) return;
@@ -109,9 +177,11 @@ static void list_msg_scanning(void){
 
 /* powered = bluetoothd up AND adapter Powered: yes */
 static int bt_on(void){
-    char b[64]; run_cap("pidof bluetoothd 2>/dev/null", b, sizeof b);
+    char b[64]; run_cap("pidof bluetoothd 2>/dev/null", b, sizeof b);   /* /proc read - can't hang */
     if(!b[0]) return 0;
-    char s[2048]; run_cap("bluetoothctl show 2>/dev/null", s, sizeof s);
+    /* bluetoothctl talks to bluetoothd over D-Bus and can stall if the daemon is wedged - bound it so
+     * this probe (called from UI poll timers) never freezes the main thread. */
+    char s[2048]; run_cap_bounded("bluetoothctl show 2>/dev/null", s, sizeof s, 250);
     return strstr(s, "Powered: yes") != NULL;
 }
 
@@ -196,12 +266,19 @@ static void bt_enable(void){
 }
 static void bt_disable(void){
     scan_abort();          /* cancel any pending/active scan + the bt_open observer (covers the radio-timeout
-                            * OFF path, which reaches here without a caller-side scan_abort) */
+                            * OFF path, which reaches here without a caller-side scan_abort). LVGL-touching,
+                            * so it MUST stay on the main thread. */
     bt_autoroute_stop();
-    system("rm -f /tmp/bt_enabling; "     /* cancel any in-flight bt_enable() subshell first */
-           "bluetoothctl power off >/dev/null 2>&1; hciconfig hci0 down >/dev/null 2>&1; "
-           "killall bluealsa bluetoothd brcm_patchram_plus fiio_bluetoothctl bt-agent 2>/dev/null; "
-           "rfkill block bluetooth >/dev/null 2>&1");
+    /* Tear the stack down in a BACKGROUNDED subshell so the UI never blocks: `bluetoothctl power off`
+     * stalls for the D-Bus timeout if bluetoothd is wedged, and running that synchronously on the main
+     * thread froze the whole UI on a BT-off tap (Reddit report 2026-09-21). The device has no `timeout`
+     * binary, so instead of a graceful daemon power-off (which could hang the subshell before the kill)
+     * we KILL the daemons FIRST - direct, fast, no D-Bus round-trip - then drop the interface and
+     * rfkill-block. rm the enable marker first so any in-flight bt_enable() subshell aborts. */
+    system("( rm -f /tmp/bt_enabling; "
+           "killall -9 bluealsa bluetoothd brcm_patchram_plus fiio_bluetoothctl bt-agent 2>/dev/null; "
+           "hciconfig hci0 down >/dev/null 2>&1; "
+           "rfkill block bluetooth >/dev/null 2>&1 ) >/dev/null 2>&1 &");
 }
 
 /* A Bluetooth MAC must be exactly AA:BB:CC:DD:EE:FF (hex + colons) before it is ever
@@ -227,21 +304,19 @@ static void bt_autoroute_poll_cb(lv_timer_t *t){
      * meanwhile, so g_bt_autorouted is not latched and the retry stands). */
     char path[256], mac[20];
     int found = 0;
-    FILE *p = popen("bluealsa-cli list-pcms 2>/dev/null | grep -m1 a2dpsrc", "r");
-    if(p){
-        if(fgets(path, sizeof path, p)){
-            char *dev = strstr(path, "dev_");
-            if(dev){
-                dev += 4;
-                char *slash = strchr(dev, '/');
-                if(slash && slash - dev == 17){
-                    memcpy(mac, dev, 17); mac[17] = 0;
-                    for(int i = 0; i < 17; i++) if(mac[i] == '_') mac[i] = ':';
-                    found = bt_mac_valid(mac);
-                }
+    /* bounded: bluealsa-cli talks to bluealsa and can stall if it is wedged; this runs on a 3s poll
+     * timer (main thread), so a hang here would freeze the UI. No `timeout` binary on the device. */
+    if(run_cap_bounded("bluealsa-cli list-pcms 2>/dev/null | grep -m1 a2dpsrc", path, sizeof path, 250) > 0){
+        char *dev = strstr(path, "dev_");
+        if(dev){
+            dev += 4;
+            char *slash = strchr(dev, '/');
+            if(slash && slash - dev == 17){
+                memcpy(mac, dev, 17); mac[17] = 0;
+                for(int i = 0; i < 17; i++) if(mac[i] == '_') mac[i] = ':';
+                found = bt_mac_valid(mac);
             }
         }
-        pclose(p);
     }
     if(!found){ g_bt_autorouted[0] = 0; return; }
     if(strcmp(mac, g_bt_autorouted)){
@@ -734,6 +809,10 @@ int bt_toggle(void){
     cfg_set_int("bt_on", on);
     if(on){
         bt_enable();
+        g_radio_start = lv_tick_get();
+        if(g_scanwait_timer){ lv_timer_del(g_scanwait_timer); g_scanwait_timer = NULL; }
+        if(g_radio_timer) lv_timer_del(g_radio_timer);
+        g_radio_timer = lv_timer_create(radio_on_poll_cb, 1000, NULL);
     } else {
         if(g_radio_timer){ lv_timer_del(g_radio_timer); g_radio_timer = NULL; }        /* cancel the bring-up poll too */
         if(g_bt_conn_timer){ lv_timer_del(g_bt_conn_timer); g_bt_conn_timer = NULL; }  /* don't let it scan_kick() after BT off */
@@ -754,11 +833,11 @@ int bt_toggle(void){
  * up, so BT audio survives reboots with no BT-screen visit. Uses its OWN poll timer (not
  * g_radio_timer) and never scans (no BT screen at boot). */
 void bt_init_intent(void){
-    if(cfg_get_int("bt_on", -1) >= 0) return;             /* already owned by diskOS */
-    char buf[32];
-    run_cap("sqlite3 /usr/data/fiio/db/sysconfig.db \"SELECT BT_STATUS FROM SYSCONFIG WHERE ID=1\" 2>/dev/null",
-            buf, sizeof buf);
-    if(buf[0]=='0' || buf[0]=='1') cfg_set_int("bt_on", buf[0]-'0');   /* only latch a valid read */
+    if(cfg_get_int("bt_on", -1) >= 0) return;             /* already owned by diskOS - keep the user's choice */
+    /* Default OFF on a fresh diskOS: do NOT inherit stock's SYSCONFIG.BT_STATUS. BT on-by-default put
+     * users one tap from the freeze bug (now fixed), and most listening here is wired - so a new install
+     * starts with Bluetooth off and the user enables it when they want it. */
+    cfg_set_int("bt_on", 0);
 }
 static lv_timer_t *g_bootrestore_timer;
 static uint32_t    g_bootrestore_start;

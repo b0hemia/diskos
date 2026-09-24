@@ -43,7 +43,7 @@ EXCLUer=(
 
 # native tools + payload that MUST be present for a TAG (fail rather than ship an unusable tarball)
 REQ_VENDOR=(usbboot mksquashfs unsquashfs my_write5_dram.bin disc_spl_lpddr3.bin)
-REQ_PAYLOAD=(mq_ui S97diskos_install S99usbserial diskos-debug.sh dropbearmulti)
+REQ_PAYLOAD=(mq_ui S96diskos_select S97diskos_install S99usbserial diskos-debug.sh dropbearmulti diskos-rmguard diskos-selected diskos-bootprobe)
 
 made=()
 for TAG in "$@"; do
@@ -107,8 +107,9 @@ See the bundled `README.md`. Requires putting the device in mask-ROM (power off,
 USB). ~15 min; normally recoverable via mask-ROM, but not guaranteed.
 
 ## Honest status
-Enthusiast flasher. Linux tested end-to-end on real hardware (V2.09 + V2.28). macOS build validation
-in progress. Not affiliated with FiiO.
+Enthusiast flasher. Linux flashing is tested on real hardware; see the release notes for the test
+status of each firmware version. macOS image builds work; macOS device flashing is unverified.
+Not affiliated with FiiO.
 EOF
 echo "  -> $NOTES"
 echo "Done. Attach $REL/* to the GitHub Release."

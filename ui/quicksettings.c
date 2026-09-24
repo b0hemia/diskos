@@ -69,6 +69,7 @@ static const qtile_t QTILES[QT_COUNT] = {
 
 static lv_obj_t *g_qs_root;
 static lv_obj_t *g_bright;
+static lv_obj_t *g_prev_glyph, *g_next_glyph;
 static lv_obj_t *g_pp_glyph;                 /* transport play/pause glyph (NULL when transport is off) */
 static lv_obj_t *g_tile_dot[QT_COUNT];       /* the circle per shown tile, recoloured on refresh */
 
@@ -125,7 +126,7 @@ static void tile_short_cb(lv_event_t *e){
         case QT_BT:        { int on = bt_toggle();   tile_recolor(QT_BT,   on); ui_toast(on ? "Turning on Bluetooth..." : "Bluetooth off"); } break;
         case QT_EQ:        eq_toggle(); break;
         case QT_SEARCH:    screen_show(SCR_SEARCH); break;
-        case QT_RESCAN:    ui_rescan_library(); ui_toast("Rescanning library..."); break;
+        case QT_RESCAN:    ui_rescan_library(); break;
         case QT_MODE:      modes_open(); break;
         case QT_SCREENOFF: ui_request_sleep(); screen_show(SCR_SAVER); break;
         case QT_SHUFFLE: {
@@ -213,9 +214,7 @@ static void build_tile(lv_obj_t *root, int id, int x, int y){
 /* ---- optional transport row -------------------------------------------------------------------- */
 static void cmd_cb(lv_event_t *e){
     const char *c = (const char*)lv_event_get_user_data(e); if(!c) return;
-    ui_defer_sleep();   /* a transport tap changes state -> don't let the sleep check race a stale read */
-    if(!strcmp(c,"0201000C0001") || !strcmp(c,"0201000C0002")){ ui_cancel_book_resume(); ui_disarm_book_eoc(); }  /* next/prev = explicit nav */
-    ipc_send_cmd(c);
+    if(ui_transport_command(c) == 0) quicksettings_refresh(ui_is_playing());
 }
 static lv_obj_t *tp_btn(lv_obj_t *root, const char *sym, const lv_font_t *font, int x, int y, int sz, void *cmd){
     lv_obj_t *b = lv_button_create(root);
@@ -237,9 +236,9 @@ static lv_obj_t *tp_btn(lv_obj_t *root, const char *sym, const lv_font_t *font, 
     return l;
 }
 static void build_transport(lv_obj_t *root, int y){
-    tp_btn(root, LV_SYMBOL_PREV, &lv_font_montserrat_22, -84, y + 5, 46, (void*)"0201000C0002");
+    g_prev_glyph = tp_btn(root, LV_SYMBOL_PREV, &lv_font_montserrat_22, -84, y + 5, 46, (void*)"0201000C0002");
     g_pp_glyph = tp_btn(root, LV_SYMBOL_PAUSE, &lv_font_montserrat_28, 0, y, 56, (void*)"0201000C0000");
-    tp_btn(root, LV_SYMBOL_NEXT, &lv_font_montserrat_22, 84, y + 5, 46, (void*)"0201000C0001");
+    g_next_glyph = tp_btn(root, LV_SYMBOL_NEXT, &lv_font_montserrat_22, 84, y + 5, 46, (void*)"0201000C0001");
     if(g_pp_glyph) lv_label_set_text(g_pp_glyph, ui_is_playing() ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 }
 
@@ -277,7 +276,7 @@ void quicksettings_create(lv_obj_t *root){ g_qs_root = root; }   /* defer to qui
 void quicksettings_build(void){
     if(!g_qs_root) return;
     lv_obj_clean(g_qs_root);
-    g_bright = NULL; g_pp_glyph = NULL;
+    g_bright = NULL; g_pp_glyph = NULL; g_prev_glyph = NULL; g_next_glyph = NULL;
     for(int i=0;i<QT_COUNT;i++) g_tile_dot[i] = NULL;
 
     lv_obj_set_style_bg_color(g_qs_root, lv_color_hex(0x000000), 0);
@@ -315,13 +314,23 @@ void quicksettings_build(void){
         }
         y += H_ROW + GAP;
     }
+    quicksettings_refresh(ui_is_playing());
 }
 
 /* light update while the panel is open (playstate ticks, radio/EQ state changes) - no rebuild */
 void quicksettings_refresh(int playing){
     if(g_bright && !lv_obj_has_state(g_bright, LV_STATE_PRESSED))
         lv_slider_set_value(g_bright, ui_get_brightness(), LV_ANIM_OFF);
-    if(g_pp_glyph) lv_label_set_text(g_pp_glyph, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    if(g_pp_glyph) lv_label_set_text(g_pp_glyph, ui_pp_icon_playing(playing) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    int book = ui_book_active();
+    if(g_prev_glyph){
+        lv_label_set_text(g_prev_glyph, book ? "-15" : LV_SYMBOL_PREV);
+        lv_obj_set_style_text_font(g_prev_glyph, book ? &lv_font_montserrat_16 : &lv_font_montserrat_22, 0);
+    }
+    if(g_next_glyph){
+        lv_label_set_text(g_next_glyph, book ? "+30" : LV_SYMBOL_NEXT);
+        lv_obj_set_style_text_font(g_next_glyph, book ? &lv_font_montserrat_16 : &lv_font_montserrat_22, 0);
+    }
     for(int i=0;i<QT_COUNT;i++)
         if(g_tile_dot[i]) tile_recolor(i, qtile_is_on(i));
 }
@@ -335,7 +344,17 @@ static void qscfg_sw_cb(lv_event_t *e){
     int id = (int)(intptr_t)lv_event_get_user_data(e);
     lv_obj_t *sw = lv_event_get_target(e);
     int on = lv_obj_has_state(sw, LV_STATE_CHECKED) ? 1 : 0;
-    if(id < 0){ cfg_set_int("qs_transport", on); return; }   /* id -1 = the transport row */
+    if(id < 0){
+        int cnt = 0;
+        for(int i=0;i<QT_COUNT;i++) if(cfg_get_int(QTILES[i].cfg, QTILES[i].def_on)) cnt++;
+        if(on && cnt > 5){
+            lv_obj_remove_state(sw, LV_STATE_CHECKED);
+            ui_toast("Turn off a tile first");
+            return;
+        }
+        cfg_set_int("qs_transport", on);
+        return;
+    }   /* id -1 = the transport row */
     if(on){                                                  /* refuse to enable past the drawer's tile cap */
         int cap = qs_cap();
         int cnt = 0; for(int i=0;i<QT_COUNT;i++) if(cfg_get_int(QTILES[i].cfg, QTILES[i].def_on)) cnt++;

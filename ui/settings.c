@@ -7,8 +7,30 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
-#include <stdlib.h>   /* system() for the stock-UI switch */
+#include <stdlib.h>
 #include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <sys/reboot.h>
+#include "sdio.h"
+#include "art.h"
+#include "scanner.h"
+
+/* Run a shell command as a bounded child in its OWN process group, and NEVER blocking-reap it: a child
+ * stuck in kernel I/O must not be able to hold the UI thread - or a restart - even for a moment. */
+static void bounded_detached(const char *cmd, int ms){
+    pid_t p = fork();
+    if(p == 0){ setsid(); execl("/bin/sh", "sh", "-c", cmd, (char*)NULL); _exit(127); }
+    if(p <= 0) return;
+    for(int i = 0; i < ms/100; i++){
+        if(waitpid(p, NULL, WNOHANG) == p) return;
+        usleep(100000);
+    }
+    kill(-p, SIGKILL); kill(p, SIGKILL);
+    (void)waitpid(p, NULL, WNOHANG);          /* opportunistic only */
+}
 
 /* ---- setting model ------------------------------------------------------ */
 typedef enum { ST_TOGGLE, ST_SLIDER, ST_CYCLER, ST_READONLY, ST_ACTION } st_type_t;
@@ -71,9 +93,6 @@ static void apply_sleep(int idx){
 static void apply_np_style(int v){ ui_set_np_style(v); }
 static void apply_rescan(int v){ (void)v;
     ui_rescan_library();
-    /* 0622 has no completion oracle, so we can't say when/whether it finished -
-     * acknowledge the REQUEST honestly rather than implying completion. */
-    ui_toast("Rescan requested");
 }
 static void apply_import_m3u(int v){ (void)v;
     int n = mdb_import_m3u_sd("/tmp/sdcard");   /* root + case-insensitive Music/Playlist(s) subdirs */
@@ -94,13 +113,104 @@ static void apply_qsconfig(int v){ (void)v; screen_show(SCR_QSCONFIG); }  /* ope
  * (fiio_init.sh) reads a flag file: /usr/data/boot_default_stock present => the
  * default is Stock; absent => the default is diskOS. We mirror the cycler value
  * to that flag so the choice persists across reboots. */
+/* This is the user's route to the STOCK firmware, so it must not be able to hang. It used to shell out
+ * to `touch|rm && sync`: a full filesystem sync can block indefinitely on a stuck device, and it ran
+ * after the boot watchdog was already disarmed. Done natively now - create/remove the flag and fsync only
+ * the directory holding it, which is what actually makes the choice durable - with no shell and no
+ * global sync. Failure is reported rather than silently diverging from the shown setting. */
 static void apply_boot_default(int v){
-    /* `&&` (not `;`) so the flag write must SUCCEED before sync - with `;` the sync's exit status masked
-     * a failed touch/rm (e.g. /usr/data read-only or full), silently diverging the boot flag from the
-     * shown setting. Surface the failure so the user knows the boot UI didn't actually change. */
-    int rc = (v == 1) ? system("touch /usr/data/boot_default_stock && sync")   /* default = Stock */
-                      : system("rm -f /usr/data/boot_default_stock && sync");  /* default = diskOS (rm -f: absent is OK) */
-    if(rc != 0) ui_toast("Couldn't change boot UI");
+    const char *flag = "/usr/data/boot_default_stock";
+    /* The whole persistence operation runs in a BOUNDED child, pathname operations included. fsync is
+     * the obvious blocker, but open() and unlink() on a stalled device block too, and this is the screen
+     * the user needs in order to select stock - it must never be the thing that freezes. The child's exit
+     * status tells us whether the choice was actually recorded: EVERY step that makes it durable (file
+     * create/fsync/close or unlink, then directory open/fsync/close) must succeed, or it exits nonzero. */
+
+    /* Children that timed out on an earlier call are remembered and reaped here, never waited on. */
+    static pid_t orphans[8];
+    int free_slot = -1;
+    for(int i = 0; i < 8; i++){
+        if(orphans[i] > 0 && waitpid(orphans[i], NULL, WNOHANG) == orphans[i]) orphans[i] = 0;
+        if(orphans[i] <= 0 && free_slot < 0) free_slot = i;
+    }
+    /* Reserve the slot BEFORE forking: a child we could not remember if it timed out would be forgotten
+     * unreaped. With every slot held by a stuck child, refuse rather than start another. */
+    if(free_slot < 0){ ui_toast("Couldn't change boot UI"); return; }
+
+    int ok = 0;
+    pid_t p = fork();
+    if(p == 0){
+        setsid();                                  /* best effort: the parent also kills the pid directly */
+        /* Drop the UI's identity BEFORE any storage I/O. A child forked from the UI still carries its argv
+         * ("mq_ui"), which is what fiio_init's watchdog looks for, so a child stuck in storage I/O would look
+         * like a live UI and could hide a dead one. The kernel reports /proc/<pid>/cmdline from
+         * [arg_start, arg_end) - ordinary writable memory of this process - so overwrite it. /proc is read
+         * with stdio, not with the storage calls below. */
+        {
+            int renamed = 0;                           /* identity removal is MANDATORY (see above) */
+            FILE *sf = fopen("/proc/self/stat", "r");
+            if(sf){
+                char buf[1024];
+                size_t n = fread(buf, 1, sizeof buf - 1, sf);
+                fclose(sf);
+                buf[n] = 0;
+                char *q = strrchr(buf, ')');       /* comm may contain spaces; fields resume after ')' */
+                unsigned long long field[64] = {0};
+                if(q){
+                    int i = 3;                     /* the first field after ')' is field 3 (state) */
+                    char *save = NULL;
+                    for(char *t = strtok_r(q + 2, " ", &save); t && i < 60; t = strtok_r(NULL, " ", &save), i++)
+                        field[i] = strtoull(t, NULL, 10);
+                }
+                unsigned long long start = field[48], end = field[49];   /* arg_start, arg_end (Linux >= 3.5) */
+                if(start && end > start && end - start <= 65536){
+                    static const char name[] = "diskos-pref";
+                    size_t len = (size_t)(end - start);
+                    memset((void *)(uintptr_t)start, 0, len);
+                    memcpy((void *)(uintptr_t)start, name, len < sizeof name ? len - 1 : sizeof name - 1);
+                    renamed = 1;
+                }
+            }
+            /* If the identity could not be dropped, touch no storage at all: a child that might block while
+             * still looking like "mq_ui" is exactly what this protects against. Report failure instead. */
+            if(!renamed) _exit(2);
+        }
+        int r = 0;
+        if(v == 1){
+            int fd = open(flag, O_WRONLY|O_CREAT|O_CLOEXEC, 0644);
+            if(fd < 0) r = -1;
+            else {
+                if(fsync(fd) != 0) r = -1;
+                if(close(fd) != 0) r = -1;
+            }
+        } else {
+            if(unlink(flag) != 0 && errno != ENOENT) r = -1;
+        }
+        if(r == 0){
+            int dfd = open("/usr/data", O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+            if(dfd < 0) r = -1;
+            else {
+                if(fsync(dfd) != 0) r = -1;
+                if(close(dfd) != 0) r = -1;
+            }
+        }
+        _exit(r == 0 ? 0 : 1);
+    }
+    if(p > 0){
+        int st = 0;
+        for(int i = 0; i < 30; i++){                    /* ~3s */
+            if(waitpid(p, &st, WNOHANG) == p){ ok = WIFEXITED(st) && WEXITSTATUS(st) == 0; p = -1; break; }
+            usleep(100000);
+        }
+        if(p > 0){
+            /* timed out: kill the child itself (its group only exists if setsid worked), never block, and
+             * remember it so a later call reaps it instead of leaving a zombie */
+            kill(-p, SIGKILL);
+            kill(p, SIGKILL);
+            if(waitpid(p, NULL, WNOHANG) != p) orphans[free_slot] = p;   /* reserved before the fork */
+        }
+    }
+    if(!ok) ui_toast("Couldn't change boot UI");
 }
 
 static lv_obj_t *g_boot_modal;
@@ -113,7 +223,20 @@ static void boot_confirm_cb(lv_event_t *e){
      * not on a UI-triggered reboot - so without this a Restart soon after a time correction leaves the RTC
      * stale and the next boot comes up at the fallback clock (12:00) until NTP re-syncs. Bounded so a busy
      * I2C/RTC can't wedge the reboot. */
-    system("hwclock -w 2>/dev/null; sync; reboot");
+    /* Stop our own SD work before a forced restart. Closing admission is not enough on its own: a scan
+     * holds one lease for its whole walk and the prewarm decoder is non-cancellable, so both are stopped
+     * explicitly. This is a FORCED restart, not an orderly flush - an already-admitted writer can still
+     * have work in flight, and the bounded sync below is best-effort, not a guarantee. */
+    sd_io_hold();
+    scanner_abort();
+    art_kill_all();
+    /* The RTC write and the flush get SEPARATE budgets. Sharing one let a busy I2C bus consume the whole
+     * allowance and leave no time to flush, so the restart proceeded with nothing written back. Each runs
+     * in its own process group and is never blocking-reaped. */
+    bounded_detached("hwclock -w 2>/dev/null", 2000);
+    bounded_detached("sync", 2000);
+    reboot(RB_AUTOBOOT);            /* direct syscall: no shell, no PATH, no binary on disk */
+    bounded_detached("reboot", 5000);   /* only reached if the syscall was refused */
 }
 static void boot_modal_pill(lv_obj_t *card, int x, const char *txt, uint32_t col, lv_event_cb_t cb){
     lv_obj_t *b = lv_button_create(card);
@@ -130,7 +253,7 @@ static void boot_modal_pill(lv_obj_t *card, int x, const char *txt, uint32_t col
     lv_obj_set_style_text_color(l, lv_color_hex(col), 0);
     lv_obj_center(l);
 }
-static void apply_restart(int v){ (void)v;
+static void __attribute__((unused)) apply_restart(int v){ (void)v;   /* menu row withheld in v1.1.3 */
     boot_modal_close();
     g_boot_modal = lv_obj_create(lv_layer_top());
     lv_obj_remove_style_all(g_boot_modal);
@@ -308,11 +431,11 @@ static const setting_t TABLE[] = {
     { "System",   "Import Playlists", ST_ACTION, NULL, 0,0,0, NULL,0, "Import", apply_import_m3u, 0,
       "Import .m3u / .m3u8 playlists found on the SD card.", NULL },
     { "System",   "Default UI",  ST_CYCLER, "boot_default", 0,0,0, OPT_BOOTDEF, 2, NULL, apply_boot_default, 0,
-      "Which UI boots by default. Hold Vol-Up at power-on to boot the other one.", NULL },
-    { "System",   "Restart",     ST_ACTION, NULL, 0,0,0, NULL,0, "Restart", apply_restart, 0,
-      "Restart the device. Boots your default UI; hold Vol-Up for the other one.", NULL },
+      "Which UI boots by default. To boot the other one, hold Vol-Up from power-on until it appears.", NULL },
+    /* Restart is withheld from v1.1.3: its forced reboot can cut off card writes (it gives the flush 2 s, then
+     * reboots regardless). Restore this row once it waits for writers and a successful flush. */
     { "System",   "Debug Mode",  ST_ACTION, NULL, 0,0,0, NULL,0, LV_SYMBOL_RIGHT, apply_debug_mode, 0,
-      "Enable SSH (random password) + a USB serial root shell for debugging. Off by default.", NULL },
+      "Enable temporary SSH over Wi-Fi (fresh random password) for debugging. Off by default.", NULL },
     { "System",   "Temperature", ST_READONLY, NULL, 0,0,0, NULL,0, "@temp", NULL, 0,
       "Battery/board temperature from the fuel gauge (this SoC exposes no core sensor).", NULL },
     { "System",   "About",       ST_READONLY, NULL, 0,0,0, NULL,0, "diskOS beta", NULL, 0,
@@ -358,7 +481,6 @@ static void val_text(const setting_t *s, char *buf, int n){
 }
 
 /* ---- shared widgets ----------------------------------------------------- */
-#define ACCENT 0xFF375F
 
 static lv_obj_t *g_list_rows[N_SETTINGS];   /* value labels, to refresh in place */
 static const setting_t *g_active;           /* setting shown in the detail screen */
@@ -419,13 +541,13 @@ void setting_detail_refresh(void){
         lv_slider_set_range(sl, s->min, s->max);
         lv_slider_set_value(sl, v, LV_ANIM_OFF);
         lv_obj_set_style_bg_color(sl, lv_color_hex(0x2C2C2E), LV_PART_MAIN);
-        lv_obj_set_style_bg_color(sl, lv_color_hex(ACCENT), LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(sl, ui_current_accent(), LV_PART_INDICATOR);
         lv_obj_set_style_bg_color(sl, lv_color_hex(0xFFFFFF), LV_PART_KNOB);
         lv_obj_t *vl = lv_label_create(g_detail_root);
         char b[16]; val_text(s,b,sizeof b); lv_label_set_text(vl,b);
         lv_obj_set_width(vl, 360); lv_obj_align(vl, LV_ALIGN_CENTER, 0, 40);
         lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(vl, lv_color_hex(ACCENT), 0);
+        lv_obj_set_style_text_color(vl, ui_current_accent(), 0);
         lv_obj_set_style_text_font(vl, &lv_font_montserrat_20, 0);
         lv_obj_add_event_cb(sl, detail_slider_cb, LV_EVENT_VALUE_CHANGED, vl);
         lv_obj_add_event_cb(sl, detail_slider_release_cb, LV_EVENT_RELEASED, NULL);
@@ -433,7 +555,7 @@ void setting_detail_refresh(void){
     } else if(s->type == ST_TOGGLE){
         lv_obj_t *sw = lv_switch_create(g_detail_root);
         lv_obj_align(sw, LV_ALIGN_CENTER, 0, 0);
-        lv_obj_set_style_bg_color(sw, lv_color_hex(ACCENT), LV_PART_INDICATOR | LV_STATE_CHECKED);
+        lv_obj_set_style_bg_color(sw, ui_current_accent(), LV_PART_INDICATOR | LV_STATE_CHECKED);
         if(v) lv_obj_add_state(sw, LV_STATE_CHECKED);
         lv_obj_add_event_cb(sw, detail_toggle_cb, LV_EVENT_VALUE_CHANGED, NULL);
     } else if(s->type == ST_CYCLER){
@@ -442,7 +564,7 @@ void setting_detail_refresh(void){
         char b[24]; val_text(s,b,sizeof b); lv_label_set_text(vl,b);
         lv_obj_set_width(vl, 220); lv_obj_align(vl, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_CENTER, 0);
-        lv_obj_set_style_text_color(vl, lv_color_hex(ACCENT), 0);
+        lv_obj_set_style_text_color(vl, ui_current_accent(), 0);
         lv_obj_set_style_text_font(vl, &lv_font_montserrat_24, 0);
         lv_obj_t *lb = lv_button_create(g_detail_root);
         lv_obj_remove_style_all(lb); lv_obj_set_size(lb, 48, 48);
@@ -609,18 +731,28 @@ void setlist_refresh(void){
 
         lv_obj_t *lbl = lv_label_create(row);
         lv_label_set_text(lbl, s->label);
-        lv_obj_set_pos(lbl, 18, 15);
+        lv_obj_set_pos(lbl, 18, 6);
+        lv_obj_set_size(lbl, 252, 20);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_DOT);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_style_text_color(lbl, lv_color_hex(0xFFFFFF), 0);
 
         char b[24]; val_text(s, b, sizeof b);
         lv_obj_t *vl = lv_label_create(row);
         lv_label_set_text(vl, b);
-        lv_obj_set_pos(vl, 150, 16);
-        lv_obj_set_size(vl, 120, 20);
-        lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_RIGHT, 0);
+        lv_obj_set_pos(vl, 18, 27);
+        lv_obj_set_size(vl, 252, 18);
+        lv_label_set_long_mode(vl, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_set_style_text_font(vl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(vl, lv_color_hex(s->type==ST_READONLY?0x8E8E93:0xC7C7CC), 0);
+        if(s->type == ST_ACTION){
+            lv_obj_set_pos(lbl, 18, 15);
+            lv_obj_set_size(lbl, 198, 20);
+            lv_obj_set_pos(vl, 224, 17);
+            lv_obj_set_size(vl, 46, 18);
+            lv_obj_set_style_text_align(vl, LV_TEXT_ALIGN_RIGHT, 0);
+        }
         g_list_rows[i] = vl;
     }
 }

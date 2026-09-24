@@ -1,23 +1,24 @@
 #!/bin/sh
 # diskOS first-boot installer. Runs at S97 - BEFORE S98FIIO launches the UI, and after
 # S21mount_ubifs has mounted /usr/data. Installs the diskOS UI into /usr/data (which survives
-# rootfs flashes) from - in deterministic precedence - (1) the copy EMBEDDED in this rootfs at
-# /opt/diskos/mq_ui (present after a diskOS flash; needs no SD card), else (2) <SD>/diskos/mq_ui as
-# a fallback source. EITHER source is copied ONLY after verifying it against the manifest baked into
-# this rootfs (/etc/diskos_manifest): exact size, ELF32-LE, MIPS machine, and SHA-256. This stops a
-# corrupt, wrong, or substituted UI from being copied in and run as root. Read-only SD mount.
+# rootfs flashes) from the copy EMBEDDED in this rootfs at /opt/diskos/mq_ui (present after a diskOS
+# flash). The old <SD>/diskos/mq_ui fallback source is DISABLED in v1.1.3: this script never mounts or
+# reads the SD card. The copy is installed ONLY after verifying it against the manifest baked into this
+# rootfs (/etc/diskos_manifest): exact size, ELF32-LE, MIPS machine, and SHA-256. This stops a corrupt,
+# wrong, or substituted UI from being copied in and run as root.
 #
 # FAIL-CLOSED CONTRACT: the diskOS boot override in fiio_init.sh runs our UI ONLY when BOTH
 # /usr/data/mq_ui AND the /usr/data/mq_player symlink exist; otherwise it falls back to the STOCK
 # rootfs UI. So the load-bearing safety lever is the mq_player symlink: whenever we cannot PROVE
 # /usr/data/mq_ui matches the manifest (missing/bad manifest, failed verify, failed repair), we
 # remove that symlink (and move the binary aside) so the stock UI runs instead of an unverified
-# binary. Every SD-touching op is time-bounded so a faulty card can delay but never hang boot.
+# binary.
 #
 # RESIDUAL LIMITS (documented, not shell-fixable): a process wedged in uninterruptible (D-state)
-# kernel I/O cannot be killed by any signal, so a truly dead SD controller can still stall this
-# script until the kernel gives up on the I/O; and if BusyBox lacks the `timeout` applet the
-# bounds degrade to best-effort. Neither is reachable from userspace shell.
+# kernel I/O cannot be killed by any signal, so a truly stuck NAND read can still stall the worker until
+# the kernel gives up on the I/O (the outer supervisor still lets the boot continue into stock); and the
+# per-operation bounds need the `timeout` applet, which V2.09/V2.28/V2.40 do not have, so on those
+# firmwares only the outer supervisor bounds this script.
 # EARLIEST fail-closed trap - the FIRST executable statement in the script (only comments precede
 # it; no file operation runs before it). For every catchable TERMINATING signal it arms an inline
 # handler that performs the load-bearing action (drop the mq_player symlink -> boot override
@@ -31,6 +32,62 @@
 # undefined on MIPS, so nothing further is needed). Per-signal arming (`2>/dev/null || true`) so a
 # name an odd build rejects can't abort the set. Superseded below by the guarded trap once
 # quarantine() exists.
+# >>> SUPERVISOR BEGIN (tests slice between these markers - keep them)
+# SUPERVISOR. rcS runs the S-scripts SYNCHRONOUSLY, so anything that blocks in here blocks the entire
+# boot and the user reaches NEITHER diskOS nor stock - the one outcome we must never cause. Signalling
+# ourselves cannot fix that: a shell blocked in a command substitution does not run its trap until the
+# substitution finishes. So the real work runs as a CHILD in its OWN session, and this parent enforces a
+# monotonic deadline, then ALWAYS exits 0 - the boot never waits on our verdict.
+#
+# Three things this must get right, each of which was wrong in an earlier version:
+#  - Do not `wait`. A worker stuck in uninterruptible disk I/O never makes wait return, and a worker that
+#    has exited but not been reaped still answers `kill -0`. We poll for a completion marker instead, so
+#    boot continuation depends on neither.
+#  - Kill the worker's whole PROCESS GROUP, not just the worker. Otherwise a copy it started keeps running
+#    after stock has started (this is covered by a test).
+#  - Only kill on TIMEOUT. Reusing a finished worker's pid as a process group id could signal something
+#    unrelated.
+if [ "$1" != "__worker" ]; then
+    rm -f /tmp/.diskos_ready 2>/dev/null          # readiness is per invocation and never inherited
+    # S96 records this boot's choice. Anything but a positive "diskos" record - stock chosen, selector failed,
+    # timed out or never ran - means do no NAND work at all: the user's route to the stock firmware must not
+    # wait on, or be able to be broken by, a diskOS install step. The record is read ONLY through the shared
+    # helper, which rejects a non-regular file before opening it (so a FIFO at the path cannot block us here,
+    # before our supervisor exists, short of the path being swapped mid-check) and applies the same exact rule
+    # as the boot hook and main.c. A missing helper also means stock.
+    # (DISKOS_SELECTED exists only so host tests can point at the payload copy; nothing sets it at boot.)
+    "${DISKOS_SELECTED:-/opt/diskos/bin/diskos-selected}" || exit 0
+    _pidf=/tmp/.diskos_s97.$$.pgid
+    _donef=/tmp/.diskos_s97.$$.done
+    rm -f "$_pidf" "$_donef" 2>/dev/null
+    if command -v setsid >/dev/null 2>&1; then
+        setsid "$0" __worker "$_pidf" "$_donef" "$@" &
+    else
+        "$0" __worker "$_pidf" "$_donef" "$@" &   # no setsid: group cleanup is unavailable, bound still holds
+    fi
+    _worker=$!
+    _now=$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)
+    _end=$(( _now + 180 ))
+    _timedout=1
+    while [ "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo "$_end")" -lt "$_end" ]; do
+        if [ -f "$_donef" ]; then _timedout=0; break; fi
+        sleep 1
+    done
+    if [ "$_timedout" = 1 ]; then
+        _wpg=$(cat "$_pidf" 2>/dev/null)
+        [ -n "$_wpg" ] && kill -KILL -"$_wpg" 2>/dev/null
+        kill -KILL "$_worker" 2>/dev/null
+        rm -f /tmp/.diskos_ready 2>/dev/null      # a killed worker must never leave readiness behind
+    fi
+    rm -f "$_pidf" "$_donef" 2>/dev/null
+    exit 0
+fi
+shift                        # drop __worker
+_pidf="$1"; _donef="$2"; shift 2
+echo $$ > "$_pidf" 2>/dev/null            # our pid IS our process group id, thanks to setsid
+trap 'echo 1 > "$_donef" 2>/dev/null' EXIT
+# <<< SUPERVISOR END
+
 SIGS="TERM HUP INT QUIT PWR ABRT ALRM PIPE USR1 USR2 XCPU XFSZ ILL TRAP BUS FPE SEGV SYS VTALRM PROF IO 7"
 _qtrap='rm -rf /usr/data/mq_player 2>/dev/null; [ -e /usr/data/mq_ui ] && mv -f /usr/data/mq_ui /usr/data/mq_ui.rejected 2>/dev/null; exit 1'
 # Arm the standard signals FIRST - this loop is the first executable statement (only the two var
@@ -77,7 +134,13 @@ quarantine() {
 # and if /usr/data is unwritable, quarantine cannot unlink the override AND this script cannot stop
 # the SysV dispatcher reaching S98 - unrecoverable-from-shell, logged CRITICAL (a true boot
 # fail-stop belongs in the rootfs boot hook, tracked separately, not this S-script).
-disarm() { for s in $SIGS; do trap - "$s" 2>/dev/null || true; done; }
+# READINESS GATE. The boot hook launches diskOS only when this marker is present. It lives on tmpfs, so
+# it means "S97 completed THIS boot" and nothing else. A worker that was killed by the supervisor, hung,
+# or crashed never reaches disarm and so never writes it - and the hook then boots STOCK without our
+# needing to successfully delete anything from NAND first (quarantine can itself fail on a full or
+# read-only filesystem, which used to leave the override enabled with no one to veto it).
+ready() { override_on && : > /tmp/.diskos_ready 2>/dev/null; }
+disarm() { ready; for s in $SIGS; do trap - "$s" 2>/dev/null || true; done; }
 installed=0
 for s in $SIGS; do trap '[ "$installed" = 1 ] || quarantine "signal"; exit 1' "$s" 2>/dev/null || true; done
 
@@ -89,7 +152,7 @@ TO() {
     if command -v timeout >/dev/null 2>&1; then
         timeout -s KILL 60 "$@"
     else
-        [ "$warned_to" = 1 ] || { log "WARNING: no 'timeout' applet -> SD ops are UNBOUNDED this boot"; warned_to=1; }
+        [ "$warned_to" = 1 ] || { log "WARNING: no 'timeout' applet -> per-step bounds unavailable (outer supervisor still applies)"; warned_to=1; }
         "$@"
     fi
 }
@@ -114,14 +177,19 @@ MSIZE=$(grep '^SIZE=' "$MAN" | cut -d= -f2)
 [ -n "$MSHA" ] && [ -n "$MSIZE" ] || { quarantine "malformed manifest" || exit 1; disarm; exit 0; }
 
 # verify_ui <file>: 0 only if it exactly matches the manifest (size, ELF32-LE, MIPS, sha256).
+# Each read is bounded where the firmware provides `timeout` (it does not on V2.09/V2.28/V2.40; the outer
+# supervisor then bounds the whole hook). A timed-out read yields an empty result, which fails its
+# comparison and rejects the candidate - fail-closed, which quarantines to stock.
 verify_ui() {
-    f="$1"; [ -f "$f" ] || return 1
-    sz=$(stat -c%s "$f" 2>/dev/null); [ -n "$sz" ] || sz=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+    f="$1"
+    TO test -f "$f" || return 1                       # even the existence test can stall on faulty storage
+    sz=$(TO stat -c%s "$f" 2>/dev/null)
+    [ -n "$sz" ] || sz=$(TO sh -c 'wc -c < "$1"' sh "$f" 2>/dev/null | tr -d ' ')   # open INSIDE the bound
     [ "$sz" = "$MSIZE" ]                      || { log "verify $f: size $sz != $MSIZE"; return 1; }
-    [ "$(od -An -tx1 -N4 "$f" | tr -d ' ')" = "7f454c46" ] || { log "verify $f: not ELF"; return 1; }
-    [ "$(od -An -tx1 -j4 -N2 "$f" | tr -d ' ')" = "0101" ] || { log "verify $f: not ELF32-LE"; return 1; }  # EI_CLASS=32,EI_DATA=LE
-    [ "$(od -An -tx1 -j18 -N2 "$f" | tr -d ' ')" = "0800" ] || { log "verify $f: not MIPS"; return 1; }
-    [ "$(sha256sum "$f" | cut -d' ' -f1)" = "$MSHA" ]       || { log "verify $f: sha256 mismatch"; return 1; }
+    [ "$(TO od -An -tx1 -N4 "$f" | tr -d ' ')" = "7f454c46" ] || { log "verify $f: not ELF"; return 1; }
+    [ "$(TO od -An -tx1 -j4 -N2 "$f" | tr -d ' ')" = "0101" ] || { log "verify $f: not ELF32-LE"; return 1; }  # EI_CLASS=32,EI_DATA=LE
+    [ "$(TO od -An -tx1 -j18 -N2 "$f" | tr -d ' ')" = "0800" ] || { log "verify $f: not MIPS"; return 1; }
+    [ "$(TO sha256sum "$f" | cut -d' ' -f1)" = "$MSHA" ]       || { log "verify $f: sha256 mismatch"; return 1; }
     return 0
 }
 
@@ -130,9 +198,10 @@ rm -f /usr/data/.mq_ui.tmp 2>/dev/null   # never trust a leftover temp from a pr
 # FAST PATH: an already-installed matching UI -> just repair exec bit + symlink and boot.
 if verify_ui /usr/data/mq_ui; then
     if publish_symlink; then
-        installed=1; disarm                     # a completed install: disarm before exit so no late-signal quarantine
+        installed=1
         log "already installed + verified -> repaired +x/symlink, booting diskOS"
-        exit 0
+        disarm                                  # publish readiness AFTER the last NAND write, so a worker
+        exit 0                                  # killed during that write does not leave diskOS enabled
     fi
     log "already-installed repair (chmod/ln) failed -> quarantining"
     quarantine "repair failed" || exit 1   # can't guarantee it launches -> fall back to stock
@@ -140,65 +209,43 @@ if verify_ui /usr/data/mq_ui; then
 fi
 
 # Reaching here means /usr/data/mq_ui is absent or does NOT match the manifest. Pre-emptively
-# QUARANTINE any existing override NOW - BEFORE the SD window - so an interrupted copy can never
-# leave the unverified binary enabled for S98 to launch. A successful SD install below republishes
+# QUARANTINE any existing override NOW - BEFORE the copy - so an interrupted copy can never
+# leave the unverified binary enabled for S98 to launch. A successful install below republishes
 # a verified one. (The whole-run trap above already covers signals; this closes the window
 # deterministically even absent a signal.)
 if [ -e /usr/data/mq_ui ] || [ -e /usr/data/mq_player ]; then
     quarantine "unverified at boot" || exit 1
 fi
 
-# INSTALL PATH - SOURCE PRECEDENCE (deterministic, NOT newest-wins): try the copy EMBEDDED in this
-# rootfs at /opt/diskos/mq_ui FIRST (present after a diskOS flash, needs no SD card); if it is absent
-# OR its local copy fails manifest verification, fall through to <SD>/diskos/mq_ui as a recovery
-# source. The embedded source only "wins" (copied=1, SD skipped) when its temp passes verify_ui - so
-# a valid same-hash SD copy CAN rescue a corrupted embedded copy. The SD is a fallback SOURCE, not an
-# override (no version/newer-wins). The winning temp is re-verified + published below.
+# INSTALL PATH: the copy EMBEDDED in this rootfs at /opt/diskos/mq_ui (present after a diskOS flash) is
+# the ONLY source in v1.1.3. It is staged to a local temp and must pass verify_ui; it is re-verified and
+# published below. If it is absent or fails verification, nothing is installed and stock boots.
 copied=0; src=
 EMBED=/opt/diskos/mq_ui
 if [ -f "$EMBED" ]; then
     # Embedded copy lives in the read-only rootfs we just flashed. TO-bound the cp for consistency
-    # (a NAND read fault shouldn't stall boot), and verify_ui the temp IN-BRANCH: only a verified
-    # embedded copy suppresses the SD fallback.
+    # (a NAND read fault shouldn't stall boot), and verify_ui the temp IN-BRANCH.
     if TO cp "$EMBED" /usr/data/.mq_ui.tmp 2>/dev/null && verify_ui /usr/data/.mq_ui.tmp; then
         copied=1; src=embedded; log "staged verified UI from embedded rootfs copy ($EMBED)"
     else
         rm -f /usr/data/.mq_ui.tmp 2>/dev/null
-        log "embedded UI absent or failed verify -> trying SD fallback"
+        log "embedded UI absent or failed verify"
     fi
 fi
 
-# SD FALLBACK: only when the rootfs carried no VERIFIED UI. Mount the SD read-only, copy
-# <SD>/diskos/mq_ui to the LOCAL temp, unmount; mount/cp/umount are all TO-bounded; no verification
-# ever runs against the (possibly faulty) card (the publish block below verifies the local copy).
+# SD FALLBACK: DISABLED in v1.1.3. This hook runs under an outer time limit, and when that limit fires the
+# boot continues into stock - so an SD mount or copy still running at that moment could overlap the stock
+# player's own handling of the card. The installer always embeds a verified UI in the rootfs, so the
+# fallback only ever mattered for recovery. If the embedded copy is absent or fails verification, nothing is
+# installed this boot, readiness is not published, and the device boots stock. The card is never touched.
 if [ "$copied" != 1 ]; then
-    MP=/tmp/diskos_sd; mkdir -p "$MP"; mounted=0
-    for dev in /dev/mmcblk0p1 /dev/mmcblk1p1 /dev/mmcblk0 /dev/mmcblk1; do
-        [ -b "$dev" ] || continue
-        for fs in exfat vfat; do
-            TO mount -t $fs -o ro "$dev" "$MP" 2>/dev/null && { mounted=1; break; }
-        done
-        [ "$mounted" = 1 ] && break
-    done
-    if [ "$mounted" = 1 ]; then
-        # No pre-stat of the SD path (that could hang) - let the bounded cp fail fast if it's absent.
-        if TO cp "$MP/diskos/mq_ui" /usr/data/.mq_ui.tmp 2>/dev/null; then
-            copied=1; src=SD
-        else
-            log "no readable <SD>/diskos/mq_ui (or copy timed out) -> nothing to install"
-        fi
-        if TO umount "$MP" 2>/dev/null || TO umount -l "$MP" 2>/dev/null; then :; else
-            log "WARNING: SD would not unmount (card may stay mounted; publish is unaffected - it uses the local copy)"
-        fi
-    else
-        log "no SD mounted -> nothing to install this boot"
-    fi
+    log "embedded UI unavailable or unverified -> not installing this boot (SD fallback disabled); stock boots"
 fi
 
 if [ "$copied" = 1 ]; then
     # Verify the LOCAL copy, then publish atomically. installed=1 is gated on the CORRECTNESS steps
-    # only (verify -> chmod -> mv -> publish_symlink[proves exact target] -> re-verify); publishing
-    # is independent of whether the SD unmounted, since it works entirely on the local copy.
+    # only (verify -> chmod -> mv -> publish_symlink[proves exact target] -> re-verify); it works
+    # entirely on the local copy.
     # Durability rides on /usr/data being sync-mounted ubifs; the explicit sync is TO-bounded and
     # deliberately NOT part of the success gate.
     if verify_ui /usr/data/.mq_ui.tmp \
@@ -209,7 +256,7 @@ if [ "$copied" = 1 ]; then
         installed=1; log "installed verified mq_ui from ${src:-?} (size $MSIZE)"
         TO sync 2>/dev/null || log "post-install sync slow/timed-out (ubifs is sync-mounted; already durable)"
     else
-        log "SD copy failed verification/publish -> not installed"
+        log "staged copy failed verification/publish -> not installed"
     fi
 fi
 rm -f /usr/data/.mq_ui.tmp 2>/dev/null   # always clean the temp, incl. a timed-out/partial copy

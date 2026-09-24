@@ -19,3 +19,8 @@ touchdisc
 # Font source blobs (fonts are shipped as generated font_*.c arrays)
 *.ttf
 config.mk
+mq_ui.debug
+mq_ui.manifest
+# host test binaries (built under tests/)
+tests/config_test
+tests/playstate_test

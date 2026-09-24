@@ -37,7 +37,7 @@ if os.path.isdir(payload):
 # payload for this host is missing.
 _required_native = ["usbboot", "mksquashfs", "unsquashfs",
                     "my_write5_dram.bin", "disc_spl_lpddr3.bin"]
-_required_payload = ["mq_ui", "S97diskos_install", "S99usbserial", "diskos-debug.sh", "dropbearmulti"]
+_required_payload = ["mq_ui", "S96diskos_select", "S97diskos_install", "S99usbserial", "diskos-debug.sh", "dropbearmulti", "diskos-rmguard", "diskos-selected", "diskos-bootprobe"]
 _missing = [n for n in _required_native if not os.path.exists(os.path.join(vend, n))]
 _missing += [f"payload/{n}" for n in _required_payload if not os.path.exists(os.path.join(payload, n))]
 if _missing:

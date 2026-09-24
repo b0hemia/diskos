@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
+#include "sdio.h"
 #include "artcache.h"
 #include <stdio.h>
 #include <string.h>
@@ -7,6 +8,8 @@
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <stdatomic.h>
 
 /* cache lives on the (large) SD card so it persists across reboots */
@@ -32,6 +35,19 @@ static int fingerprint(const char *track, char *out, int cap){
     snprintf(out, cap, "%016llx", (unsigned long long)h);
     return 0;
 }
+/* fsync the directory that CONTAINS `path` so a just-completed rename is durable: on a non-journaled
+ * FS a power cut can otherwise leave the directory block without the new entry even though the file
+ * data hit the disk. Best-effort - a driver that doesn't implement directory fsync just no-ops. */
+static void fsync_parent_dir(const char *path){
+    char d[600]; snprintf(d, sizeof d, "%s", path);
+    char *slash = strrchr(d, '/');
+    if(!slash) return;
+    if(slash == d) slash[1] = 0; else slash[0] = 0;   /* keep a leading "/" as the dir */
+    int fd = open(d, O_RDONLY | O_DIRECTORY);
+    if(fd < 0) return;
+    fsync(fd);                                         /* errors (incl. unsupported) are non-fatal */
+    close(fd);
+}
 static int file_ok(const char *p){ struct stat s; return stat(p,&s)==0 && s.st_size>100; }
 static void cache_paths(const char *fp, char *cv, char *th, char *bg, int cap){
     snprintf(cv,cap,"%s/%s/c.bmp",CACHE_ROOT,fp);
@@ -53,9 +69,17 @@ static int copy_file(const char *src, const char *dst){
     if(ferror(in)) ok=0;                       /* read error mid-copy -> don't publish a truncated file */
     fclose(in);
     if(fflush(out)!=0) ok=0;
+    /* fsync the data onto the card BEFORE the rename publishes it, so a power cut / yanked card can't
+     * surface a rename pointing at unflushed content (the exact non-journaled-exFAT corruption window).
+     * A driver that doesn't implement fsync (EINVAL/ENOSYS/EOPNOTSUPP) is tolerated. */
+    if(ok){
+        int fd = fileno(out);
+        if(fd >= 0 && fsync(fd) != 0 && errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP) ok = 0;
+    }
     fclose(out);
     if(!ok){ unlink(tmp); return -1; }
     if(rename(tmp,dst)!=0){ unlink(tmp); return -1; }
+    fsync_parent_dir(dst);                     /* make the rename itself durable */
     return 0;
 }
 static int enough_free(void){
@@ -64,13 +88,13 @@ static int enough_free(void){
     return ((uint64_t)v.f_bavail * v.f_frsize) > MIN_FREE_BYTES;
 }
 
-int artcache_has(const char *track){
+static int artcache_has_leased(const char *track){
     char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return 0;
     char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
     return file_ok(cv) && file_ok(th) && file_ok(bg);
 }
 
-int artcache_get(const char *track, const char *cover_out, const char *thumb_out, const char *bg_out){
+static int artcache_get_leased(const char *track, const char *cover_out, const char *thumb_out, const char *bg_out){
     char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return -1;
     char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
     if(!(file_ok(cv) && file_ok(th) && file_ok(bg))) return -1;
@@ -81,7 +105,7 @@ int artcache_get(const char *track, const char *cover_out, const char *thumb_out
     return 0;
 }
 
-int artcache_get_thumb(const char *track, const char *thumb_out){
+static int artcache_get_thumb_leased(const char *track, const char *thumb_out){
     char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return -1;
     char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
     if(!file_ok(th)) return -1;          /* thumb not cached (or truncated) */
@@ -91,7 +115,7 @@ int artcache_get_thumb(const char *track, const char *thumb_out){
 
 /* Return the native path of the cached 148px cover for a track (no copy), so a caller can read/decode it
  * directly (e.g. an off-thread cover loader). Returns 0 + fills out on a cache hit, -1 if not cached. */
-int artcache_cover_path(const char *track, char *out, int cap){
+static int artcache_cover_path_leased(const char *track, char *out, int cap){
     char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return -1;
     char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
     if(!file_ok(cv)) return -1;
@@ -101,7 +125,7 @@ int artcache_cover_path(const char *track, char *out, int cap){
 
 /* Copy JUST the cached 148px cover (no thumb/backdrop) - used by the Album Wall, which only needs the
  * cover, so it avoids copying the ~360px backdrop every step. Returns 0 on hit, -1 if not cached. */
-int artcache_get_cover(const char *track, const char *cover_out){
+static int artcache_get_cover_leased(const char *track, const char *cover_out){
     char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return -1;
     char cv[600],th[600],bg[600]; cache_paths(fp,cv,th,bg,600);
     if(!file_ok(cv)) return -1;
@@ -114,7 +138,7 @@ int artcache_get_cover(const char *track, const char *cover_out){
 static _Atomic unsigned g_ac_gen;
 unsigned artcache_gen(void){ return atomic_load(&g_ac_gen); }
 
-void artcache_put(const char *track, const char *cover, const char *thumb, const char *bg){
+static void artcache_put_leased(const char *track, const char *cover, const char *thumb, const char *bg){
     char fp[24]; if(fingerprint(track,fp,sizeof fp)!=0) return;
     if(!enough_free()) return;
     if(!sd_write_begin()) return;   /* M18: card is host-owned or an export is in progress -> skip the SD write */
@@ -128,4 +152,45 @@ void artcache_put(const char *track, const char *cover, const char *thumb, const
     copy_file(thumb,th); copy_file(bg,bg2);
     sd_write_end();
     if(cover_ok) atomic_fetch_add(&g_ac_gen, 1);   /* signal the cover flow that a new cover is available */
+}
+
+int artcache_has(const char *track){
+    if(!sd_io_begin()) return 0;
+    int result = artcache_has_leased(track);
+    sd_io_end();
+    return result;
+}
+
+int artcache_get(const char *track, const char *cover_out, const char *thumb_out, const char *bg_out){
+    if(!sd_io_begin()) return -1;
+    int result = artcache_get_leased(track, cover_out, thumb_out, bg_out);
+    sd_io_end();
+    return result;
+}
+
+int artcache_get_thumb(const char *track, const char *thumb_out){
+    if(!sd_io_begin()) return -1;
+    int result = artcache_get_thumb_leased(track, thumb_out);
+    sd_io_end();
+    return result;
+}
+
+int artcache_get_cover(const char *track, const char *cover_out){
+    if(!sd_io_begin()) return -1;
+    int result = artcache_get_cover_leased(track, cover_out);
+    sd_io_end();
+    return result;
+}
+
+int artcache_cover_path(const char *track, char *out, int cap){
+    if(!sd_io_begin()) return -1;
+    int result = artcache_cover_path_leased(track, out, cap);
+    sd_io_end();
+    return result;
+}
+
+void artcache_put(const char *track, const char *cover, const char *thumb, const char *bg){
+    if(!sd_io_begin()) return;
+    artcache_put_leased(track, cover, thumb, bg);
+    sd_io_end();
 }

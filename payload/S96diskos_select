@@ -1,0 +1,84 @@
+#!/bin/sh
+# diskOS boot selector. Runs BEFORE the diskOS first-boot installer (S97) and before anything launches a
+# UI, and decides - once per boot, for both the UI and the player - whether this boot belongs to diskOS or
+# to the stock firmware.
+#
+# WHY THIS EXISTS: the choice used to be made inside the diskOS binary itself, so reaching stock depended
+# on diskOS starting correctly and getting that far. Deciding here means the decision is made before any
+# diskOS UI code runs, and every later step only has to honour it.
+#
+# MODEL (unchanged): /usr/data/boot_default_stock present => the default is Stock, absent => diskOS.
+# Holding Vol-Up at power-on selects the OTHER one for this boot: effective = default XOR override.
+#
+# THE RECORD: /tmp/.diskos_boot_select holds exactly "diskos\n" or "stock\n". It is the ONLY input every
+# later step uses: S97 and the boot hook through /opt/diskos/bin/diskos-selected, and the diskOS binary
+# through the identical rule in main.c. Nothing samples the button a second time. It lives on tmpfs, so
+# it means "this boot" and writing it does not touch NAND.
+#
+# FAILURE POLICY: diskOS needs a POSITIVE record. Missing, partial or malformed means stock everywhere.
+# Every failure below resolves to stock: /usr/data not mounted, a preference lookup error other than
+# "no such file", a failed pin read, a missed deadline, a missing or failing probe, malformed output.
+#
+# BOUNDING: the preference lookup (NAND) and the pin read (/dev/mem) run in /opt/diskos/bin/diskos-bootprobe,
+# a small native supervisor that forks the probe into its own process group, enforces a CLOCK_MONOTONIC
+# deadline, never reaps the probe before killing it (so its pid cannot be reused under it), kills it if the
+# supervisor itself dies (PR_SET_PDEATHSIG), and keeps the probe off this script's stdout, so this command
+# substitution returns even if the probe is stuck in the kernel. This script itself only touches tmpfs.
+# What cannot be bounded from here: the rootfs itself (loading this script or the probe binary), tmpfs, and
+# the scheduler. There is no `timeout` applet on V2.09/V2.28/V2.40.
+#
+# The DISKOS_* variables exist only so host tests can use private paths; nothing sets them at boot.
+REC=${DISKOS_BOOT_SELECT:-/tmp/.diskos_boot_select}
+WHY=$REC.why
+PREF=${DISKOS_PREF_FILE:-/usr/data/boot_default_stock}
+DATA_MNT=${DISKOS_DATA_MOUNT:-/usr/data}
+PROBE=${DISKOS_BOOTPROBE:-/opt/diskos/bin/diskos-bootprobe}
+MEMDEV=${DISKOS_MEMDEV:-/dev/mem}
+DEADLINE_MS=${DISKOS_SELECT_DEADLINE_MS:-5000}
+
+set -f                     # no pathname expansion anywhere: probe output is data, never a glob
+
+# Only a boot-time "start" decides, and only once per boot: a later invocation (another start, reload,
+# anything) must not resample and replace the decision the boot already acted on. mkdir is atomic and
+# exclusive, so of two concurrent starts exactly one proceeds; if it fails for any other reason we decide
+# nothing, and no record means stock.
+[ "$1" = start ] || exit 0
+mkdir "$REC.decided" 2>/dev/null || exit 0
+
+rm -f "$REC" "$REC.tmp" "$WHY" 2>/dev/null          # never inherit a record this boot did not write
+rm -f /tmp/.diskos_boot_stock 2>/dev/null            # legacy marker from an earlier selector design
+
+decide() {   # $1 = diskos|stock, $2 = reason. A failed write leaves no record, which also means stock.
+    printf '%s\n' "$2" > "$WHY" 2>/dev/null
+    printf '%s\n' "$1" > "$REC.tmp" 2>/dev/null && mv -f "$REC.tmp" "$REC" 2>/dev/null
+    exit 0
+}
+
+line=$("$PROBE" "$PREF" "$DATA_MNT" "$DEADLINE_MS" "$MEMDEV" 2>/dev/null)
+prc=$?
+[ "$prc" = 0 ] || decide stock "probe failed to run (rc=$prc)"
+
+# Validate the WHOLE result before any arithmetic: a malformed value in $(( )) aborts BusyBox ash
+# (verified on V2.40). Globbing is off (set -f above), so splitting cannot turn data into filenames.
+set -- $line
+[ $# -eq 3 ] || decide stock "malformed probe result ($# fields): '$line'"
+flag="$1"; rc="$2"; gpb="$3"
+case "$flag" in
+    0|1) ;;
+    E) decide stock "preference lookup failed: $DATA_MNT not mounted, or lstat of $PREF failed other than ENOENT" ;;
+    T) decide stock "timeout: the probe did not report within ${DEADLINE_MS}ms" ;;
+    *) decide stock "probe could not complete: '$line'" ;;
+esac
+[ "$rc" = 0 ] || decide stock "pin read failed; default flag=$flag"
+case "$gpb" in
+    0[xX][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]) ;;
+    *) decide stock "malformed pin value '$gpb'; default flag=$flag" ;;
+esac
+
+volup=0
+[ $(( gpb & 0x2000 )) -eq 0 ] && volup=1
+
+if [ $(( flag ^ volup )) -eq 1 ]; then
+    decide stock "flag=$flag volup=$volup gpb=$gpb"
+fi
+decide diskos "flag=$flag volup=$volup gpb=$gpb"

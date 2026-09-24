@@ -120,7 +120,7 @@ static void refresh(void){
         lv_label_set_text(g_ssh, "Debug access is OFF");
         lv_obj_add_flag(g_pw, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(g_serial, LV_OBJ_FLAG_HIDDEN);
-        lv_label_set_text(g_warn, "Enables SSH (fresh random password) + a USB serial root shell.");
+        lv_label_set_text(g_warn, "Enables SSH over Wi-Fi with a fresh random password.");
         lv_label_set_text(g_btnlbl, "Enable Debug");
     }
 }

@@ -9,6 +9,7 @@
 #include "artcache.h"   /* persistent decoded-cover cache on SD */
 #include "config.h"
 #include "screens.h"
+#include "sdio.h"
 #include "anim.h"
 #include "fonts_intl.h"   /* Cyrillic/Greek/Latin-ext fallback (issue #3) */
 
@@ -289,32 +290,43 @@ static void style_text(lv_obj_t *obj, const lv_font_t *font, lv_color_t color)
     lv_obj_set_style_text_letter_space(obj, 0, LV_PART_MAIN);
 }
 
-static void transport_cb(lv_event_t *e)
+int ui_transport_command(const char *cmd)
 {
-    const char *cmd = (const char *)lv_event_get_user_data(e);
-    if(!cmd) return;
-    ui_defer_sleep();   /* a transport tap changes play state -> don't let the sleep check race a stale read */
-    int is_next = !strcmp(cmd, "0201000C0001"), is_prev = !strcmp(cmd, "0201000C0002");
+    if(!cmd) return -1;
+    int is_next = !strcmp(cmd, "0201000C0001");
+    int is_prev = !strcmp(cmd, "0201000C0002");
+    int is_toggle = !strcmp(cmd, "0201000C0000");
+    if(!is_next && !is_prev && !is_toggle) return -1;
+    if(!ui_local_playback_allowed()){
+        ui_toast("Return to local playback first"); return -1;
+    }
+    ui_defer_sleep();
     if(is_next || is_prev){
         track_state_t st; ipc_get_state(&st);
         if(mdb_is_book_path(st.path)){
-            /* For an audiobook, skipping a whole TRACK is wrong: the on-screen prev/next become a
-             * -15s / +30s time skip (asymmetric: back a sentence, forward past intros/dead air),
-             * clamped to the book. The skip is a manual seek, so it supersedes any pending resume. */
             long tgt = st.position_ms + (is_next ? 30000 : -15000);
             if(tgt < 0) tgt = 0;
             if(st.duration_ms > 0 && tgt > st.duration_ms) tgt = st.duration_ms;
-            if(ui_seek_to(tgt) == 0){   /* only drop the pending resume if the skip actually went out */
-                g_seek_target_ms = tgt;                       /* arm the same stale-echo hold as a drag-seek so */
-                g_seek_hold_until = lv_tick_get() + 2500;     /* the chapter ring jumps straight to the target, no back-flicker */
-                ui_book_user_seeked(tgt);
-            }
-            return;
+            if(ui_seek_to(tgt) < 0){ ui_toast("Couldn't seek - try again"); return -1; }
+            g_seek_target_ms = tgt;
+            g_seek_hold_until = lv_tick_get() + 2500;
+            ui_book_user_seeked(tgt);
+            return 0;
         }
-        ui_cancel_book_resume();   /* music: next/prev change the track -> drop any pending resume */
-        ui_disarm_book_eoc();      /* explicit nav -> disarm any end-of-chapter sleep left armed after a rollover */
     }
-    ipc_send_cmd(cmd);
+    if(ipc_send_cmd(cmd) < 0){ ui_toast("Player busy - try again"); return -1; }
+    if(is_toggle){
+        ui_pp_tap_hint();
+        set_label_text_changed(btn_pp, ui_pp_icon_playing(ui_is_playing()) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    } else {
+        ui_cancel_book_resume();
+        ui_disarm_book_eoc();
+    }
+    return 0;
+}
+static void transport_cb(lv_event_t *e)
+{
+    ui_transport_command((const char *)lv_event_get_user_data(e));
 }
 
 /* The cover opens Song Info on a TAP, but it is also where a horizontal
@@ -1322,6 +1334,7 @@ static int pw_charging(void){
  * for every active mode: never decode while the user is actively looking at the screen
  * (heat-/UX-safety), even on charge. m1=when idle, m2=idle AND charging. */
 static int pw_window_open(void){
+    if(!sd_io_allowed()) return 0;
     int m=g_prewarm_mode; if(m==0) return 0;
     if(!ui_main_is_idle()) return 0;   /* screen dimmed/off required */
     if(m==2) return pw_charging();     /* idle & charging */
@@ -1331,6 +1344,7 @@ static int pw_window_open(void){
 /* Block until heat + the live decode allow another ffmpeg. Shared by both prewarm phases. */
 static void pw_wait_window(int *hot){
     for(;;){
+        if(!sd_io_allowed()){ usleep(200000); continue; }
         int t = pw_temp_dc();                       /* battery temp, tenths-C; fail-closed if unreadable */
         if(t < 0){ sleep(15); continue; }
         if(*hot){ if(t < 400) *hot=0; else { sleep(15); continue; } }   /* hysteresis: pause >=42C, resume <40C */
@@ -1463,15 +1477,17 @@ const char *ui_current_backdrop_src(void)
  * so fallback glyphs sit on the same baseline; LVGL uses the PRIMARY font's line-height, and
  * each intl line-height (20/23/28) fits within Montserrat's (20/24/28) so nothing clips.
  * We keep mutable copies because .fallback must be set on non-const fonts. */
+static lv_font_t s_cjk; /* existing subset plus the small music-metadata supplement */
 static lv_font_t s_font20, s_font18, s_font16, s_font14;      /* Montserrat, chain heads */
 static lv_font_t s_intl20, s_intl18, s_intl16, s_intl14;      /* intl link (fallback -> Source Han) */
 static void ui_fonts_init(void)
 {
     if(s_font20.get_glyph_dsc) return;   /* once */
-    s_intl20 = font_intl_20; s_intl20.fallback = &lv_font_source_han_16_cjk;
-    s_intl18 = font_intl_18; s_intl18.fallback = &lv_font_source_han_16_cjk;
-    s_intl16 = font_intl_16; s_intl16.fallback = &lv_font_source_han_16_cjk;
-    s_intl14 = font_intl_14; s_intl14.fallback = &lv_font_source_han_16_cjk;
+    s_cjk = lv_font_source_han_16_cjk; s_cjk.fallback = &font_cjk_extra_16;
+    s_intl20 = font_intl_20; s_intl20.fallback = &s_cjk;
+    s_intl18 = font_intl_18; s_intl18.fallback = &s_cjk;
+    s_intl16 = font_intl_16; s_intl16.fallback = &s_cjk;
+    s_intl14 = font_intl_14; s_intl14.fallback = &s_cjk;
     s_font20 = lv_font_montserrat_20; s_font20.fallback = &s_intl20;
     s_font18 = lv_font_montserrat_18; s_font18.fallback = &s_intl18;
     s_font16 = lv_font_montserrat_16; s_font16.fallback = &s_intl16;
@@ -1909,7 +1925,7 @@ void ui_update(const track_state_t *st)
     if(g_seek_hold_until) {
         long d = pos - g_seek_target_ms; if(d < 0) d = -d;   /* ABSOLUTE ms gap - unaffected by a chapter-window flip at a seek-to-boundary */
         if(lv_tick_get() < g_seek_hold_until && d > 3000) {
-            set_label_text_changed(btn_pp, st->state == 2 ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+            set_label_text_changed(btn_pp, ui_pp_icon_playing(st->state == 2) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
             return;   /* ignore this stale echo */
         }
         g_seek_hold_until = 0; g_seek_target_ms = -1;   /* caught up or window lapsed */
@@ -1929,7 +1945,7 @@ void ui_update(const track_state_t *st)
     set_label_text_changed(t_remain, remain_buf);
     set_progress_changed(progress);
 
-    set_label_text_changed(btn_pp, st->state == 2 ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    set_label_text_changed(btn_pp, ui_pp_icon_playing(st->state == 2) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 }
 
 /* ---- volume overlay: a draggable arc on lv_layer_top (shows over any screen).

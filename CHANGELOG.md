@@ -5,6 +5,73 @@ All notable changes to diskOS are documented here.
 Entries follow the Keep a Changelog format, with Added, Changed, and Fixed categories where applicable.
 diskOS remains beta software; version numbers do not imply broad hardware or feature validation.
 
+## [1.1.3] - 2026-09-24
+
+A safety release. The stock FiiO player, which diskOS runs alongside, tries to unmount the microSD
+card and then deletes everything at the card's mount point, without checking that the unmount
+worked. If the card is still mounted, this can delete its contents. The flaw is confirmed in the
+stock player on V2.09, V2.28, and V2.40. It has not been proven to be the cause of the two reported
+card wipes. Every diskOS user should update; updating requires the complete installer and a new flash.
+
+### Added
+
+- A delete guard in the flashed image, at `/bin/rm` and first on the stock player's `PATH` (so the
+  stock fallback and watchdog launches are covered too). It refuses `rm` on the card or anything on
+  it; the card's folder can only be removed when it is empty and unmounted. It blocks this specific
+  deletion path, not every possible way to lose data.
+- A boot selector that runs before diskOS starts and decides once per boot between diskOS and stock.
+  Any missing or invalid result boots stock.
+- Hold Volume Up for about three seconds to force-close an external app. A message says if this is
+  unavailable.
+- Extra punctuation in the 14, 16, 18, and 20 px interface fonts, and eight more CJK characters in
+  the fallback font. This is not full CJK support.
+
+### Changed
+
+- USB Storage now waits for diskOS to finish reading and writing the card, confirms the card really
+  was handed over and really came back, and only then resumes artwork caching. A pending handoff
+  survives a UI restart.
+- USB Storage is refused during a library scan, and whenever diskOS cannot confirm that the card is
+  protected or who owns it. If a handoff is left uncertain, diskOS keeps card access off and asks for
+  a reboot.
+- Library scans, browsing, artwork, lyrics, book details, playlists, and playback commands wait for
+  these card checks. If protection is unavailable, diskOS keeps its card features off and says so;
+  the stock player still starts.
+- On V2.40, cold-boot card handling tries the direct mount before sending an insert event.
+- First-boot setup uses only the UI built into the flashed image; the SD-card fallback copy is gone.
+- Restart is temporarily removed from Settings until it can wait for card writes to finish.
+- Bluetooth starts off when there is no saved diskOS preference. Saved preferences are kept.
+  Turning it on from Quick Settings now waits for it to become ready.
+- Home, Now Playing, and Quick Settings share the same transport controls. The play/pause icon
+  responds at once. Quick Settings skips 15 s back and 30 s forward in audiobooks.
+- Quick Settings allows the transport row only with five or fewer tiles enabled.
+- Settings values sit below their labels, controls use the current accent colour, and search fits
+  the round screen better.
+- Debug Mode's description now says SSH over Wi-Fi; the USB serial shell is for developer builds.
+- The installer accepts only the unmodified official V2.09, V2.28, and V2.40 firmware for install
+  and build. The untested-firmware override no longer applies to them. V2.57 is refused.
+- Release packaging requires the boot selector, its probe and helper, and the delete guard, and the
+  image check verifies all of them and the patched boot script.
+
+### Fixed
+
+- Stopping card access now cancels a running scan and all artwork work. A cancelled scan keeps the
+  previous library.
+- Artwork cache files are flushed to the card before they are used (where the card supports it);
+  artwork and playlist exports also try to flush their folder.
+- Player start-up and the hand-off to stock have firmer time limits, clean up their helper
+  processes, and reset signals correctly.
+- Default UI's boot flag is written by a time-limited helper that reports failure.
+- Bluetooth status and audio-route checks are time-limited: the check is killed along with anything
+  it started, and cleanup never waits without a limit. Bluetooth shutdown no longer waits on the
+  Bluetooth service. This closes one way the screen could freeze, not every possible one.
+- Scan messages now tell apart refused, running, failed, and finished scans, with a count of skipped
+  files. Help hints no longer replace an active message.
+- Failed playback, seek, and playlist-export requests now report failure.
+- The mode picker keeps showing "switching" until a mode change finishes, and clears the checkmark
+  if it fails.
+- The boot log keeps earlier start-up messages until it reaches its size limit.
+
 ## [1.1.2] - 2026-09-20
 
 ### Fixed
@@ -94,6 +161,7 @@ diskOS remains beta software; version numbers do not imply broad hardware or fea
 - MIT-licensed installer tooling, recovery documentation, hardware notes, and third-party notices.
   The initial release distributed the UI as a binary; UI source publication followed in v1.1.0.
 
+[1.1.3]: https://github.com/b0hemia/diskos/compare/v1.1.2...v1.1.3
 [1.1.2]: https://github.com/b0hemia/diskos/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/b0hemia/diskos/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/b0hemia/diskos/compare/v1.0.0-beta...v1.1.0

@@ -357,7 +357,6 @@ static lv_obj_t *empty_label(const char *txt){
 static void scan_action_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
     ui_rescan_library();
-    ui_toast("Rescan requested");
 }
 static void empty_scan(const char *txt){
     empty_label(txt);

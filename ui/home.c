@@ -59,8 +59,8 @@ static void settings_event_cb(lv_event_t *e)
 static void pp_event_cb(lv_event_t *e)
 {
     if (lv_event_get_code(e) == LV_EVENT_CLICKED){
-        ui_defer_sleep();   /* a play/pause tap changes state -> don't let the sleep check race a stale read */
-        ipc_send_cmd("0201000C0000");   /* play/pause toggle */
+        if(ui_transport_command("0201000C0000") < 0) return;
+        if (g_np_state) lv_label_set_text(g_np_state, ui_pp_icon_playing(ui_is_playing()) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
     }
 }
 
@@ -180,7 +180,7 @@ void home_set_now_playing(const char *title, const char *artist,
 
     if (g_np_title) lv_label_set_text(g_np_title, title ? title : "Not Playing");
     if (g_np_artist) lv_label_set_text(g_np_artist, artist ? artist : "Library");
-    if (g_np_state) lv_label_set_text(g_np_state, playing ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
+    if (g_np_state) lv_label_set_text(g_np_state, ui_pp_icon_playing(playing) ? LV_SYMBOL_PAUSE : LV_SYMBOL_PLAY);
 
     if (g_np_thumb) lv_obj_set_style_bg_color(g_np_thumb, accent, 0);
     if (g_status_arc) lv_obj_set_style_arc_color(g_status_arc, accent, LV_PART_INDICATOR);

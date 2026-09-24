@@ -1,0 +1,38 @@
+#!/bin/sh
+# diskOS SD guard - installed read-only at /opt/diskos/bin/rm and put FIRST in PATH by the boot hook.
+#
+# The stock player prepares the card with "umount /tmp/sdcard" followed by "rm -rf /tmp/sdcard" and never
+# checks whether the umount succeeded. When the card is busy (still mounted) the delete runs on the
+# mounted card and empties it. This wrapper refuses any rm whose operand is the card mountpoint or
+# anything under it; the exact mountpoint gets the stock's legitimate "remove a stale empty dir" via a
+# NON-recursive rmdir (EBUSY while mounted, fine when empty and unmounted). Everything else is passed to
+# the real rm unchanged. The decision is made before any logging; logging is best-effort and can never
+# fall through to the real rm. Canonical paths also cover relative paths, repeated slashes,
+# dot components and symlink aliases. This is a guard for rm, not a block-device write filter.
+# Logging is evidence, not a prerequisite: it writes to NAND, and the caller here is the stock player
+# performing its mount cleanup, so a stalled write would stall THAT. Detached and size-capped, it can
+# never delay the decision above, which has already been made by the time this runs.
+log_bg() {
+    { [ -f /usr/data/diskos_rmguard.log ] && [ "$(/bin/busybox wc -c < /usr/data/diskos_rmguard.log 2>/dev/null)" -gt 65536 ]; } \
+        || echo "$(/bin/busybox date '+%F %T' 2>/dev/null) $1" >> /usr/data/diskos_rmguard.log 2>/dev/null
+}
+
+options=1
+for a in "$@"; do
+    if [ "$options" = 1 ]; then
+        case "$a" in --) options=0; continue ;; -*) continue ;; esac
+    fi
+    resolved=$(/bin/busybox readlink -f -- "$a" 2>/dev/null)
+    for operand in "$a" "$resolved"; do
+    case "$operand" in
+        /tmp/sdcard|/tmp/sdcard/)
+            /bin/busybox rmdir /tmp/sdcard 2>/dev/null
+            log_bg "rmdir-only: rm $*" &
+            exit 0 ;;
+        /|/tmp|/tmp/|/tmp/sdcard/*)
+            log_bg "blocked: rm $*" &
+            exit 0 ;;
+    esac
+    done
+done
+exec /bin/busybox rm "$@"

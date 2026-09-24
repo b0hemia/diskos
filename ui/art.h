@@ -18,4 +18,5 @@ int art_make_all_ex_gen(const char *track, const char *cover_bmp,
 unsigned art_cancel_gen(void);
 /* Kill the in-flight cancellable (live) decode, if any. */
 void art_cancel(void);
+void art_kill_all(void);   /* kill every decoder child, incl. non-cancellable prewarm/fallback */
 #endif

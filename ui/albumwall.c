@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Copyright (C) 2026 diskOS contributors */
 #include "screens.h"
+#include "sdio.h"
 #include "musicdb.h"
 #include "artcache.h"
 #include "config.h"
@@ -125,7 +126,12 @@ static void aw_bake(sprite_t *sp, int idx){
         for(int i=0;i<n;i++){
             char track[512]; track[0]=0; mdb_song_path(ids[i], track, sizeof track);
             char cov[600];
-            if(track[0] && artcache_cover_path(track, cov, sizeof cov)==0 && aw_read_bmp(cov, g_src)==0){
+            int loaded = 0;
+            if(track[0] && sd_io_begin()){
+                loaded = artcache_cover_path(track, cov, sizeof cov)==0 && aw_read_bmp(cov, g_src)==0;
+                sd_io_end();
+            }
+            if(loaded){
                 aw_bake_front(g_src, sp->fbuf); aw_bake_side(g_src, sp->sbuf);
                 aw_set_dsc(&sp->fdsc, sp->fbuf, AW_SRC, AW_SPR_H);
                 aw_set_dsc(&sp->sdsc, sp->sbuf, AW_SIDE_W, AW_SPR_H);

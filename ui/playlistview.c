@@ -104,7 +104,7 @@ static void plv_reload(void){
         lv_obj_set_style_text_color(a, lv_color_hex(0xC7C7CC), 0);
     }
     free(songs);
-    { static int hinted = 0; if(!hinted){ hinted = 1; ui_toast("Hold a song to remove it"); } }  /* L32 discoverability, once/run */
+    { static int hinted = 0; if(!hinted) hinted = ui_toast_hint("Hold a song to remove it"); }  /* L32 discoverability, once/run */
 }
 /* Public: rebuild the list from the DB. Called by the screen manager on EVERY entry
  * to SCR_PLVIEW (incl. back-nav), so tap positions can't go stale after the playlist's
@@ -238,7 +238,7 @@ static void export_cb(lv_event_t *e){   /* L37: write the playlist to /tmp/sdcar
     if(mdb_playlist_export(g_pid, g_name, fn, sizeof fn)){
         char msg[160]; snprintf(msg, sizeof msg, "Exported to %s", fn);
         ui_toast(msg);
-    } else ui_toast("Export failed - SD not available");
+    } else ui_toast("Couldn't export playlist");
 }
 static void open_menu_cb(lv_event_t *e){
     if(lv_event_get_code(e)!=LV_EVENT_CLICKED) return;
