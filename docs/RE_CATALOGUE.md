@@ -201,7 +201,7 @@ meaning is taken from the adjacent log string (string-inferred, high confidence)
 | aa1c | power-key event | `%d` |
 | aa22 | TF-card (SD) insert/remove | event `%d` |
 | aa0c/aa0f | screen status | `%X` |
-| a60a | tip/toast popup | tip code |
+| a60a | tip/toast popup (TIP_INFO_EVENT) | tip code (530 / 0x0212 = USB DAC connected, 531 / 0x0213 = USB DAC disconnected) |
 | a644 | now-playing / UI state update | song JSON (below) |
 | a622 | SD rescan / DB-rebuild status | scan state |
 | 06d0/06d1/06d2 | OTA progress / success / file-count | `%d` |

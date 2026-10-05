@@ -77,3 +77,4 @@ build/release/
 *.log
 *.tmp
 .DS_Store
+.agents/

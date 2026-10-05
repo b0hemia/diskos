@@ -51,6 +51,8 @@ static int g_player_mode = -1;   /* [g_recov_mu] last a607 external-mode announc
                                   * CHANGE. Readiness is established by the a2 probe + settle (main.c); when an a607
                                   * does arrive here, mode==8 is a valid "LOCALPLAYER set" confirmation.
                                   * Reset to -1 on /ui reopen (new player generation). See ipc_player_mode(). */
+static int g_tip_event = 0;       /* [g_recov_mu] last a60a TIP_INFO_EVENT (0x0212=connect, 0x0213=disconnect) */
+static unsigned g_tip_seq = 0;    /* [g_recov_mu] bumps on each a60a event */
 static dev_t g_tx_dev = 0;  static ino_t g_tx_ino = 0;   /* [main-thread only] identity of /player g_tx sends to */
 static int g_tx_stale    = 0;   /* [main-thread only] health -> sender: /player recreated, drop g_tx */
 static int g_thread_started = 0;         /* idempotency for ipc_start (NOT g_rx, which recovery swaps) */
@@ -229,6 +231,14 @@ static void parse_frame(const char*buf,int n){
         if(!all_hex(h,4)) return;
         int mode=(int)strtol(h,0,16);
         pthread_mutex_lock(&g_recov_mu); g_player_mode=mode; pthread_mutex_unlock(&g_recov_mu);
+    } else if(buf[0]=='a'&&buf[1]=='6'&&buf[2]=='0'&&buf[3]=='a' && n>=12){
+        /* "a60a000C<PARAM4HEX>" - TIP_INFO_EVENT from player:
+         * 0212 (530) = on_usb_connect
+         * 0213 (531) = on_usb_disconnect */
+        char h[5]={buf[8],buf[9],buf[10],buf[11],0};
+        if(!all_hex(h,4)) return;
+        int evt=(int)strtol(h,0,16);
+        pthread_mutex_lock(&g_recov_mu); g_tip_event=evt; g_tip_seq++; pthread_mutex_unlock(&g_recov_mu);
     }
     /* NB: for playback the player emits a1/a2/a714 to /ui (a2=state/love/work_mode/track, a1=position,
      * a714=volume) - no a622/a639/a704 completion replies. SEPARATELY, a 0657 mode CHANGE makes it announce
@@ -266,7 +276,7 @@ static int rx_do_reopen(void){
     g_rx = nw;                              /* g_rx is RX-thread-only; publish the fresh descriptor */
     dev_t d=0; ino_t io=0; mq_identity(nw, &d, &io);
     pthread_mutex_lock(&g_recov_mu);
-    g_rx_dev = d; g_rx_ino = io; g_rx_ready = 1; g_reconnected = 1; g_player_mode = -1; g_generation++;  /* new player gen */
+    g_rx_dev = d; g_rx_ino = io; g_rx_ready = 1; g_reconnected = 1; g_player_mode = -1; g_tip_event = 0; g_generation++;  /* new player gen */
     pthread_mutex_unlock(&g_recov_mu);
     if(old!=(mqd_t)-1 && old!=nw) mq_close(old);   /* open-before-close, but NEVER close a descriptor number
                                                     * the new mq_open reused (EBADF path: the old fd was dead,
@@ -382,6 +392,14 @@ int ipc_player_mode(void){
  * to re-arm after a restart (send the init once per generation). */
 unsigned ipc_generation(void){
     pthread_mutex_lock(&g_recov_mu); unsigned r=g_generation; pthread_mutex_unlock(&g_recov_mu);
+    return r;
+}
+/* Last a60a TIP_INFO_EVENT from player (0x0212=connect, 0x0213=disconnect). If seq != NULL, assigns event sequence. */
+int ipc_tip_event(unsigned *seq){
+    pthread_mutex_lock(&g_recov_mu);
+    int r = g_tip_event;
+    if(seq) *seq = g_tip_seq;
+    pthread_mutex_unlock(&g_recov_mu);
     return r;
 }
 void ipc_get_state(track_state_t*out){

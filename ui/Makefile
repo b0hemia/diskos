@@ -21,7 +21,7 @@ FP_FLAGS := -ffp-contract=off
 CFLAGS := -Os -pipe -std=gnu11 -static -pthread -D_GNU_SOURCE -DLV_CONF_INCLUDE_SIMPLE \
   -ffunction-sections -fdata-sections \
   -I$(APP) -I$(NUI) -Wall -MMD -MP $(REPRO_FLAGS) $(FP_FLAGS)
-# Device-test builds only: make clean && make EXTRA_CFLAGS=-DDISKOS_TEST_OUTPUTS (shows SPDIF Output + USB Audio)
+# Device-test builds only: make clean && make EXTRA_CFLAGS=-DDISKOS_TEST_OUTPUTS (shows SPDIF Output)
 CFLAGS += $(EXTRA_CFLAGS)
 # --gc-sections drops every provably-unreferenced function/data section at link (unused LVGL fonts,
 # widgets, draw backends, sqlite fns) with NO behavior change - only unreachable symbols are removed.
