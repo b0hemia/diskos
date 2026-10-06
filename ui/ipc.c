@@ -13,6 +13,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "jsmn.h"
+#include "musicdb.h"
 
 static mqd_t g_rx=(mqd_t)-1, g_tx=(mqd_t)-1;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -108,6 +109,23 @@ static int unescape(const char*s,int n,char*dst,int dstsz){
     return (i<n) ? -1 : o;   /* i<n -> stopped on the o limit, input left over = truncated */
 }
 
+/* Stock V2.57 sends the bare filename as song_name when its decoder wrapper reads no title, e.g. for Ogg Opus.
+ * Swap in the scanner's tag TITLE (mdb_tag_title_by_path) as the track is PUBLISHED, so consumers never see the
+ * title change mid-track (a title change reads as a new track to the play-start confirm and to Last.fm). One
+ * lookup per path, cached whether or not it found a title. Caller must hold g_mu. */
+static char g_tfix_path[256], g_tfix_title[160];
+static int  g_tfix_ok;
+static void fix_filename_title(char *title, int cap, const char *path){
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    if(!base[0] || strcmp(title, base) != 0) return;            /* the player sent a real title */
+    if(strcmp(path, g_tfix_path) != 0){
+        g_tfix_ok = mdb_tag_title_by_path(path, g_tfix_title, (int)sizeof g_tfix_title);
+        snprintf(g_tfix_path, sizeof g_tfix_path, "%s", path);
+    }
+    if(g_tfix_ok) snprintf(title, cap, "%s", g_tfix_title);
+}
+
 /* Zero the current-track fields. Caller must hold g_mu. */
 static void clear_track(void){
     g_state.have_track=0;
@@ -156,6 +174,7 @@ static void parse_a2(const char*payload,int len){
             sv=find_val(song,st,n2,"is_dsd");             if(sv>=0) t_dsd=tok_bool(song,&st[sv]);
             sv=find_val(song,st,n2,"pos_id");             if(sv>=0) t_pos=tok_long(song,&st[sv]);
             if(have_path){                 /* complete identity -> publish the whole track atomically */
+                fix_filename_title(t_title, (int)sizeof t_title, t_path);
                 snprintf(g_state.path,   sizeof g_state.path,   "%s", t_path);
                 snprintf(g_state.title,  sizeof g_state.title,  "%s", t_title);
                 snprintf(g_state.artist, sizeof g_state.artist, "%s", t_artist);

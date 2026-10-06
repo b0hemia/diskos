@@ -12,7 +12,8 @@
  *   AIFF  COMM sample frames / sample rate (80-bit float, integer rates only)
  *   DSF   fmt sample count / sampling frequency
  *   WMA   ASF File Properties play duration (100 ns) minus preroll (ms)
- *   OGG   Vorbis: the last page's granule position / the identification header's rate (first logical stream)
+ *   OGG   Vorbis: the last page's granule position / the identification header's rate (first logical stream);
+ *         Opus (.ogg/.opus/.oga): (last granule - OpusHead pre-skip) / 48000
  *   APE, raw AAC, DFF, DTS: unknown (0) - no single header field holds the length
  * The stock player ignores DB durations for ordinary files (it plays by the decoder's own length); only CUE/ISO
  * rows use them, and the scanner never writes those (internal RE notes). Every read is bounded; a hostile or
@@ -310,7 +311,7 @@ static long long ad_wma(FILE *f, off_t fsz){
     return 0;
 }
 
-/* ---- Ogg Vorbis ---- */
+/* ---- Ogg Vorbis / Ogg Opus ---- */
 /* Ogg's page CRC-32 (polynomial 0x04C11DB7, no reflection, init 0) over the page with its CRC field taken as zero */
 static uint32_t ad_ogg_crc(const unsigned char *p, size_t n){
     uint32_t crc = 0;
@@ -328,8 +329,13 @@ static long long ad_ogg(FILE *f, off_t fsz){
     uint32_t serial = ad_le32(h + 14);
     if(!ad_read_at(f, 27, h + 27, (size_t)nseg + 30)) return 0;
     const unsigned char *pk = h + 27 + nseg;                                  /* first packet: identification */
-    if(pk[0] != 1 || memcmp(pk + 1, "vorbis", 6) != 0) return 0;
-    uint32_t rate = ad_le32(pk + 12);
+    uint32_t rate, skip = 0;
+    if(pk[0] == 1 && !memcmp(pk + 1, "vorbis", 6)) rate = ad_le32(pk + 12);
+    else if(!memcmp(pk, "OpusHead", 8) && (pk[8] & 0xf0) == 0){              /* version 0.x only (RFC 7845) */
+        rate = 48000;                                                        /* Opus granules always count 48 kHz */
+        skip = (uint32_t)pk[10] | (uint32_t)pk[11] << 8;                     /* pre-skip: decoder priming, not audio */
+    }
+    else return 0;
     if(rate == 0) return 0;
     enum { TAIL = 65536 };
     off_t start = fsz > TAIL ? fsz - TAIL : 0;
@@ -364,7 +370,8 @@ static long long ad_ogg(FILE *f, off_t fsz){
             size_t plen = 27 + t[i + 26];
             for(size_t k = 0; k < t[i + 26]; k++) plen += t[i + 27 + k];
             unsigned long long g = (unsigned long long)ad_le32(t + i + 6) | (unsigned long long)ad_le32(t + i + 10) << 32;
-            if(ad_le32(t + i + 14) == serial && g != ~0ULL) ms = ad_muldiv(g, 1000ULL, rate);   /* ~0 = no packet ends here */
+            if(ad_le32(t + i + 14) == serial && g != ~0ULL)                     /* ~0 = no packet ends here */
+                ms = g > skip ? ad_muldiv(g - skip, 1000ULL, rate) : 0;
             i += plen;
         }
     }
@@ -392,7 +399,7 @@ static long long audio_duration_ms(FILE *f, const char *fname){
     else if(ad_ext(fname, ".aif") || ad_ext(fname, ".aiff")) ms = ad_aiff(f, fsz);
     else if(ad_ext(fname, ".dsf")) ms = ad_dsf(f, fsz);
     else if(ad_ext(fname, ".wma")) ms = ad_wma(f, fsz);
-    else if(ad_ext(fname, ".ogg")) ms = ad_ogg(f, fsz);
+    else if(ad_ext(fname, ".ogg") || ad_ext(fname, ".opus") || ad_ext(fname, ".oga")) ms = ad_ogg(f, fsz);
     if(ferror(f)) ms = -1;                         /* a READ error, not "no length": the caller keeps its old value */
     clearerr(f);
     return ms;

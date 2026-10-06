@@ -383,6 +383,35 @@ int mdb_song_meta_by_path(const char *path, char *album, int acap, char *artist,
     return found;
 }
 
+/* The tag TITLE of the plain-file row for `path`: non-empty and not the scanner's filename fallback (NAME minus
+ * its extension). Stock V2.57 reports the bare filename as song_name when its decoder wrapper reads no title
+ * (it does for Ogg Opus, even with an OpusTags TITLE the scanner stored). CUE/ISO rows are skipped: their
+ * per-track titles come from the player. Own read-only connection with a 50 ms busy bound, so it is safe on
+ * the IPC thread. 1 = found. */
+int mdb_tag_title_by_path(const char *path, char *out, int cap){
+    if(!out || cap <= 0) return 0;
+    out[0] = 0;
+    if(!path || !path[0]) return 0;
+    sqlite3 *c = NULL; int found = 0;
+    if(sqlite3_open_v2(DB_PATH, &c, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK){
+        sqlite3_busy_timeout(c, 50);
+        sqlite3_stmt *st;
+        if(sqlite3_prepare_v2(c, "SELECT IFNULL(TITLE,''),IFNULL(NAME,'') FROM SONG WHERE PATH=? "
+                                 "AND IFNULL(IS_CUE,0)=0 AND IFNULL(IS_ISO,0)=0 LIMIT 1;", -1, &st, NULL) == SQLITE_OK){
+            sqlite3_bind_text(st, 1, path, -1, SQLITE_STATIC);
+            if(sqlite3_step(st) == SQLITE_ROW){
+                const char *t = colt(st, 0), *n = colt(st, 1);
+                const char *dot = strrchr(n, '.');
+                size_t stem = dot ? (size_t)(dot - n) : strlen(n);
+                if(t[0] && !(strlen(t) == stem && !strncmp(t, n, stem))){ snprintf(out, cap, "%s", t); found = 1; }
+            }
+            sqlite3_finalize(st);
+        }
+    }
+    if(c) sqlite3_close(c);
+    return found;
+}
+
 /* The current/last "memory play" track (MEMORY_PLAY in song.db) + resume info,
  * so the UI can show what's playing on startup before any a2 frame arrives.
  * MEMORY_PLAY.MUSIC_ID maps to SONG.ID.  Returns 1 if a track was found. */

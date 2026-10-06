@@ -84,7 +84,8 @@ static int fb_is_audio(const char *name){
         /* the scanner's other formats (stock V2.57's list): a file Files shows must be one the scanner indexes */
         || fb_has_ext(name, ".aac") || fb_has_ext(name, ".ogg") || fb_has_ext(name, ".ape")
         || fb_has_ext(name, ".aif") || fb_has_ext(name, ".aiff") || fb_has_ext(name, ".wma")
-        || fb_has_ext(name, ".dsf") || fb_has_ext(name, ".dff") || fb_has_ext(name, ".dts");
+        || fb_has_ext(name, ".dsf") || fb_has_ext(name, ".dff") || fb_has_ext(name, ".dts")
+        || fb_has_ext(name, ".opus") || fb_has_ext(name, ".oga");
 }
 
 /* folders first, then files; case-insensitive within each group. */

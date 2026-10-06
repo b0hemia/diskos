@@ -10,7 +10,7 @@
  * favourites and resume state (CUSTOM_PLAYLIST/PLAYLIST_INFO/MY_LOVE/MEMORY_PLAY) are keyed
  * by PATH and left intact, so a rescan doesn't lose them.
  *
- * Tag support: see is_audio() - MP3 (ID3v2 + ID3v1), FLAC/OGG (Vorbis comments), M4A/M4B (MP4 atoms), APE (APEv2),
+ * Tag support: see is_audio() - MP3 (ID3v2 + ID3v1), FLAC/OGG/OPUS (Vorbis comments), M4A/M4B (MP4 atoms), APE (APEv2),
  * AIFF (ID3 chunk, NAME/AUTH), DSF (ID3 block), WMA (ASF), AAC (leading ID3v2); WAV/DFF/DTS by filename. Anything
  * without usable tags falls back to the filename (minus extension) as the title.
  * External .cue sheets and SACD .iso images are expanded into one row per track, the way stock V2.57 writes them (see
@@ -108,9 +108,9 @@ static int has_ext(const char *name, const char *ext){
     size_t nl=strlen(name), el=strlen(ext);
     return nl>el && !strcasecmp(name+nl-el, ext);
 }
-/* Audio files diskOS indexes: stock V2.57's scanner list. Real tags from MP3 (ID3), FLAC and OGG (Vorbis comments),
- * M4A/M4B (MP4 atoms), APE (APEv2, ID3v1 fallback), AIFF (ID3 chunk, NAME/AUTH), DSF (ID3 block), WMA (ASF) and a
- * leading ID3v2 on AAC; WAV/DFF/DTS fall back to the filename. External .cue sheets become per-track rows after the
+/* Audio files diskOS indexes: stock V2.57's scanner list plus Ogg Opus. Real tags from MP3 (ID3), FLAC, OGG and
+ * OPUS/OGA (Vorbis comments), M4A/M4B (MP4 atoms), APE (APEv2, ID3v1 fallback), AIFF (ID3 chunk, NAME/AUTH), DSF
+ * (ID3 block), WMA (ASF) and a leading ID3v2 on AAC; WAV/DFF/DTS fall back to the filename. External .cue sheets become per-track rows after the
  * walk (cue_finish); SACD .iso images likewise become per-track rows (iso_finish). */
 static int is_audio(const char *name){
     if(has_ext(name,".m4b")) return DISKOS_AUDIOBOOKS;   /* books indexed only when the audiobook feature is enabled */
@@ -119,14 +119,18 @@ static int is_audio(const char *name){
         /* the rest of stock V2.57's scanner list (P257 extension table @0x6cb6ec..): the stock player decodes them */
         || has_ext(name,".aac") || has_ext(name,".ogg") || has_ext(name,".ape") || has_ext(name,".aif")
         || has_ext(name,".aiff")|| has_ext(name,".wma") || has_ext(name,".dsf") || has_ext(name,".dff")
-        || has_ext(name,".dts");
+        || has_ext(name,".dts")
+        /* Ogg Opus: NOT in stock's scanner list, but stock V2.57's libavcodec is built with the ogg demuxer and the
+         * opus decoder/parser (its embedded configure line). mq_player's extension classifier (0x4cee98) only
+         * RECORDS the type on the play path (get_audio_mediainfo 0x44b604 -> start_local); an unknown extension is
+         * not rejected there. Verified on a V2.57 Disc: .opus (unknown, 0 type) plays and seeks; .oga is untested. */
+        || has_ext(name,".opus")|| has_ext(name,".oga");
 }
 /* Audio-ish files we do NOT index yet (no parser). Counted during the walk so the UI can tell a user
  * whose library is all AAC/ALAC/etc WHY it looks empty, instead of a bare "No music found". */
 static int is_unsupported_audio(const char *name){
-    /* not in stock V2.57's scanner list either (no .oga/.opus/.alac there; WavPack's decoder was dropped) */
-    return has_ext(name,".oga") || has_ext(name,".opus") || has_ext(name,".alac")
-        || has_ext(name,".wv");
+    /* not in stock V2.57's scanner list either (no .alac there; WavPack's decoder was dropped) */
+    return has_ext(name,".alac") || has_ext(name,".wv");
 }
 
 /* ---- text encoding -> UTF-8 (bounded) ---- */
@@ -515,10 +519,10 @@ static int scan_read_narrator_leased(const char *path, char *out, int cap){
     return found;
 }
 
-/* ---- Ogg Vorbis ----
+/* ---- Ogg Vorbis / Ogg Opus ----
  * Pages ("OggS", 27-byte header + segment table). The comment header is the stream's SECOND packet
- * ("\x03vorbis" + a Vorbis comment body); it may span pages, so packets are reassembled from the lacing values.
- * Bounded: at most 64 pages and 1 MiB of packet data; only the first logical stream is read. */
+ * ("\x03vorbis" or "OpusTags" + a Vorbis comment body); it may span pages, so packets are reassembled from the
+ * lacing values. Bounded: at most 64 pages and 1 MiB of packet data; only the first logical stream is read. */
 static void ogg_read(FILE *f, char *title,char *artist,char *album,char *genre,
                      char *album_artist, int *track, int *disc, int *rerr){
     enum { OGG_MAX = 1024*1024 };
@@ -547,6 +551,8 @@ static void ogg_read(FILE *f, char *title,char *artist,char *album,char *genre,
                 if(npkt == 2){
                     if(plen > 7 && pkt[0]==3 && !memcmp(pkt+1,"vorbis",6))
                         vorbis_comments(pkt+7, plen-7, title,artist,album,genre,album_artist,track,disc);
+                    else if(plen > 8 && !memcmp(pkt,"OpusTags",8))
+                        vorbis_comments(pkt+8, plen-8, title,artist,album,genre,album_artist,track,disc);
                     break;
                 }
                 plen = 0;                                     /* packet 1 (identification) done: start packet 2 */
@@ -757,14 +763,16 @@ static int tags_from_file(const char *path, const char *fname,
     int rerr=0;
     FILE *f=fopen(path,"rb");
     if(!f && (has_ext(fname,".flac") || has_ext(fname,".mp3") || has_ext(fname,".m4a") || has_ext(fname,".m4b")
-              || has_ext(fname,".ogg") || has_ext(fname,".ape") || has_ext(fname,".aif") || has_ext(fname,".aiff")
-              || has_ext(fname,".wma") || has_ext(fname,".dsf") || has_ext(fname,".aac")))
+              || has_ext(fname,".ogg") || has_ext(fname,".opus") || has_ext(fname,".oga") || has_ext(fname,".ape")
+              || has_ext(fname,".aif") || has_ext(fname,".aiff") || has_ext(fname,".wma") || has_ext(fname,".dsf")
+              || has_ext(fname,".aac")))
         return 0;   /* can't even open a tag-bearing file -> skip it entirely (preserve existing, no insert) */
     if(f){
         if(has_ext(fname,".flac")) flac_read(f,title,artist,album,genre,album_artist,track,disc,&rerr);
         else if(has_ext(fname,".mp3")){ id3v2_read(f,title,artist,album,genre,album_artist,track,disc,&rerr); id3v1_read(f,title,artist,album,&rerr); }
         else if(has_ext(fname,".m4a") || has_ext(fname,".m4b")) mp4_read(f,title,artist,album,genre,album_artist,track,disc,&rerr);
-        else if(has_ext(fname,".ogg")) ogg_read(f,title,artist,album,genre,album_artist,track,disc,&rerr);
+        else if(has_ext(fname,".ogg") || has_ext(fname,".opus") || has_ext(fname,".oga"))
+            ogg_read(f,title,artist,album,genre,album_artist,track,disc,&rerr);
         else if(has_ext(fname,".ape")){ ape_read(f,title,artist,album,genre,album_artist,track,disc,&rerr);
                                         if(!title[0] && fseek(f,0,SEEK_SET)==0) id3v1_read(f,title,artist,album,&rerr); }
         else if(has_ext(fname,".aif") || has_ext(fname,".aiff")) aiff_read(f,title,artist,album,genre,album_artist,track,disc,&rerr);
@@ -1759,7 +1767,8 @@ static void *scan_thread(void *arg){
                         " OR lower(PATH) LIKE '%.wav' OR lower(PATH) LIKE '%.m4a' OR lower(PATH) LIKE '%.m4b'"
                         " OR lower(PATH) LIKE '%.aac' OR lower(PATH) LIKE '%.ogg' OR lower(PATH) LIKE '%.ape'"
                         " OR lower(PATH) LIKE '%.aif' OR lower(PATH) LIKE '%.aiff' OR lower(PATH) LIKE '%.wma'"
-                        " OR lower(PATH) LIKE '%.dsf' OR lower(PATH) LIKE '%.dff' OR lower(PATH) LIKE '%.dts' OR lower(PATH) LIKE '%.iso')"
+                        " OR lower(PATH) LIKE '%.dsf' OR lower(PATH) LIKE '%.dff' OR lower(PATH) LIKE '%.dts' OR lower(PATH) LIKE '%.iso'"
+                        " OR lower(PATH) LIKE '%.opus' OR lower(PATH) LIKE '%.oga')"
                         " AND PATH LIKE '" SCAN_ROOT "/%' "
                         "AND PATH NOT IN (SELECT PATH FROM seen);";
                     int del_ok = (g_prune_blocked) ? 1

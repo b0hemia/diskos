@@ -51,6 +51,7 @@ int               mdb_song_id_by_path(const char *path);   /* SONG.ID for an abs
 /* On-demand ALBUM for a song ID. 1 if a non-empty album was found. */
 int               mdb_song_album(int id, char *out, int cap);
 int               mdb_song_meta_by_path(const char *path, char *album, int acap, char *artist, int arcap);
+int               mdb_tag_title_by_path(const char *path, char *out, int cap);   /* tag TITLE of a plain-file row; 1 = found. Safe off the UI thread */
 /* 1-based position of a song within the player's rebuilt list for a given
  * list_type (0=all,2=artist,3=album,10=genre) + name, matching mq_player's
  * exact ORDER BY so a tap lands on the exact track. Returns >=1. */

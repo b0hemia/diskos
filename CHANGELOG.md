@@ -5,6 +5,20 @@ All notable changes to diskOS are documented here.
 Entries follow the Keep a Changelog format, with Added, Changed, and Fixed categories where applicable.
 diskOS remains beta software; version numbers do not imply broad hardware or feature validation.
 
+## [Unreleased]
+
+### Added
+
+- Library and Browse Files indexing for Ogg Opus (`.opus`, `.oga`), with titles and tags from
+  `OpusTags` and exact lengths. Opus inside `.ogg` files now gets its tags and length too.
+  Playback and seeking of `.opus` files verified on a V2.57 Disc; `.oga` is untested.
+
+### Fixed
+
+- Now Playing, Home, the screensaver, and Last.fm showed the filename as the title for Ogg Opus,
+  because the stock player reports the filename when it reads no title. diskOS now uses the
+  library's tag title for that file instead.
+
 ## [1.2.0] - 2026-10-02
 
 Adds V2.57 firmware support, more library and display choices, and signed in-app diskOS updates.
