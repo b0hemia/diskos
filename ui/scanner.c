@@ -123,7 +123,7 @@ static int is_audio(const char *name){
         /* Ogg Opus: NOT in stock's scanner list, but stock V2.57's libavcodec is built with the ogg demuxer and the
          * opus decoder/parser (its embedded configure line). mq_player's extension classifier (0x4cee98) only
          * RECORDS the type on the play path (get_audio_mediainfo 0x44b604 -> start_local); an unknown extension is
-         * not rejected there. Unverified on a device: .opus/.oga playback with the unknown (0) type. */
+         * not rejected there. Verified on a V2.57 Disc: .opus (unknown, 0 type) plays and seeks; .oga is untested. */
         || has_ext(name,".opus")|| has_ext(name,".oga");
 }
 /* Audio-ish files we do NOT index yet (no parser). Counted during the walk so the UI can tell a user
