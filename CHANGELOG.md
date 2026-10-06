@@ -5,6 +5,15 @@ All notable changes to diskOS are documented here.
 Entries follow the Keep a Changelog format, with Added, Changed, and Fixed categories where applicable.
 diskOS remains beta software; version numbers do not imply broad hardware or feature validation.
 
+## [Unreleased]
+
+### Added
+
+- Library and Browse Files indexing for Ogg Opus (`.opus`, `.oga`), with titles and tags from
+  `OpusTags` and exact lengths. Opus inside `.ogg` files now gets its tags and length too. The
+  stock player's FFmpeg includes the Opus decoder, but playback of `.opus` files has not yet been
+  verified on a device.
+
 ## [1.2.0] - 2026-10-02
 
 Adds V2.57 firmware support, more library and display choices, and signed in-app diskOS updates.

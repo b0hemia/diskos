@@ -405,9 +405,9 @@ At startup, the Disc animation uses the body color selected under Display > Disc
 
 ### Limits
 
-The scanner indexes common music formats and also recognizes AAC, OGG, APE, AIFF/AIF, WMA, DSF,
-DFF, DTS, external CUE sheets, and SACD ISO tracks; appearing in a list does not prove that every
-format plays on this device. Browse Files can play only indexed files, and it does not build a
+The scanner indexes common music formats and also recognizes AAC, OGG, Opus (.opus/.oga), APE,
+AIFF/AIF, WMA, DSF, DFF, DTS, external CUE sheets, and SACD ISO tracks; appearing in a list does
+not prove that every format plays on this device. Browse Files can play only indexed files, and it does not build a
 folder-only queue. V2.09 playlist and book playback may fail. V2.57's Custom EQ editor is
 view-only, although Gain is available; older firmware has no Bluetooth codec choice. Up Next can
 jump within the player queue but cannot edit it, and network services and Bluetooth codec behavior
